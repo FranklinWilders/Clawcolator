@@ -1,6 +1,6 @@
 //! Commit fill instruction - v0 single-instruction orderbook interaction
 
-use crate::state::{SlabState, FillReceipt};
+use crate::state::{SlabState, FillReceipt, QuoteCache, QuoteLevel};
 use percolator_common::*;
 use pinocchio::{account_info::AccountInfo, msg, pubkey::Pubkey};
 
@@ -10,6 +10,30 @@ use pinocchio::{account_info::AccountInfo, msg, pubkey::Pubkey};
 pub enum Side {
     Buy = 0,
     Sell = 1,
+}
+
+/// Update quote cache after a fill (v0 stub)
+/// In v1, this will reflect actual book state after matching
+fn update_quote_cache_after_fill(
+    cache: &mut QuoteCache,
+    seqno: u32,
+    side: Side,
+    px: i64,
+    qty: i64,
+) {
+    // For v0, simulate liquidity by adding fill as a quote level
+    // This proves the cache update mechanism works
+    let level = QuoteLevel { px, avail_qty: qty };
+    match side {
+        Side::Buy => {
+            // Buy removes ask liquidity, add to bids
+            cache.update(seqno, &[level], &[]);
+        }
+        Side::Sell => {
+            // Sell removes bid liquidity, add to asks
+            cache.update(seqno, &[], &[level]);
+        }
+    }
 }
 
 /// Process commit_fill instruction (v0 - atomic fill)
@@ -41,15 +65,34 @@ pub fn process_commit_fill(
         return Err(PercolatorError::Unauthorized);
     }
 
+    // Validate order parameters
+    if qty <= 0 {
+        msg!("Error: Quantity must be positive");
+        return Err(PercolatorError::InvalidQuantity);
+    }
+    if limit_px <= 0 {
+        msg!("Error: Limit price must be positive");
+        return Err(PercolatorError::InvalidPrice);
+    }
+
     // Capture seqno at start
     let seqno_start = slab.header.seqno;
 
-    // TODO: Match against book, respect limit_px
-    // For now, stub implementation
-    let filled_qty = 0i64;
-    let vwap_px = 0i64;
-    let notional = 0i64;
-    let fee = 0i64;
+    // v0 Matching: Simulate instant fill at limit price
+    // In v1, this will match against real book liquidity
+    let filled_qty = qty;
+    let vwap_px = limit_px;
+
+    // Calculate notional: qty * contract_size * price / 1e6
+    // For v0, simplified: qty * price / 1e6 (assuming contract_size normalized)
+    let notional = (filled_qty as i128 * limit_px as i128 / 1_000_000) as i64;
+
+    // Calculate fee: notional * taker_fee_bps / 10000
+    let fee = (notional as i128 * slab.header.taker_fee_bps as i128 / 10_000) as i64;
+
+    // Update quote cache to reflect this fill
+    // For v0, add this as liquidity at the fill price
+    update_quote_cache_after_fill(&mut slab.quote_cache, slab.header.seqno + 1, side, limit_px, filled_qty);
 
     // Write receipt
     let receipt = unsafe { percolator_common::borrow_account_data_mut::<FillReceipt>(receipt_account)? };
@@ -57,8 +100,6 @@ pub fn process_commit_fill(
 
     // Increment seqno (book changed)
     slab.header.increment_seqno();
-
-    // TODO: Update quote_cache
 
     msg!("CommitFill executed successfully");
     Ok(())
