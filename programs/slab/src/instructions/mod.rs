@@ -2,11 +2,13 @@ pub mod reserve;
 pub mod commit;
 pub mod cancel;
 pub mod batch_open;
+pub mod initialize;
 
 pub use reserve::*;
 pub use commit::*;
 pub use cancel::*;
 pub use batch_open::*;
+pub use initialize::*;
 
 /// Instruction discriminator
 #[repr(u8)]

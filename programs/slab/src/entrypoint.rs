@@ -8,7 +8,7 @@ use pinocchio::{
     ProgramResult,
 };
 
-use crate::instructions::{SlabInstruction, process_reserve, process_commit, process_cancel, process_batch_open};
+use crate::instructions::{SlabInstruction, process_reserve, process_commit, process_cancel, process_batch_open, process_initialize_slab};
 use crate::state::SlabState;
 use percolator_common::{PercolatorError, validate_owner, validate_writable, borrow_account_data_mut, InstructionReader};
 
@@ -231,10 +231,18 @@ fn process_batch_open_inner(program_id: &Pubkey, accounts: &[AccountInfo], data:
 /// Process initialize instruction
 ///
 /// Expected accounts:
-/// 0. `[writable]` Slab state account (uninitialized)
+/// 0. `[writable]` Slab state account (PDA, uninitialized)
 /// 1. `[signer]` Payer/authority
 ///
-/// Expected data layout: TBD (initialization parameters)
+/// Expected data layout (168 bytes):
+/// - market_id: [u8; 32] (32 bytes)
+/// - lp_owner: Pubkey (32 bytes)
+/// - router_id: Pubkey (32 bytes)
+/// - imr: u64 (8 bytes)
+/// - mmr: u64 (8 bytes)
+/// - maker_fee: i64 (8 bytes)
+/// - taker_fee: u64 (8 bytes)
+/// - batch_ms: u64 (8 bytes)
 fn process_initialize_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if accounts.len() < 1 {
         msg!("Error: Initialize instruction requires at least 1 account");
@@ -245,13 +253,35 @@ fn process_initialize_inner(program_id: &Pubkey, accounts: &[AccountInfo], data:
     validate_owner(slab_account, program_id)?;
     validate_writable(slab_account)?;
 
-    let _slab = unsafe { borrow_account_data_mut::<SlabState>(slab_account)? };
+    // Parse instruction data
+    let mut reader = InstructionReader::new(data);
+    let market_id = reader.read_bytes::<32>()?;
+    let lp_owner_bytes = reader.read_bytes::<32>()?;
+    let router_id_bytes = reader.read_bytes::<32>()?;
+    let imr = reader.read_u64()?;
+    let mmr = reader.read_u64()?;
+    let maker_fee = reader.read_i64()?;
+    let taker_fee = reader.read_u64()?;
+    let batch_ms = reader.read_u64()?;
 
-    // TODO: Initialize slab state with default values
-    // This will be implemented when we have initialization logic
-    let _ = data;
+    let lp_owner = Pubkey::from(lp_owner_bytes);
+    let router_id = Pubkey::from(router_id_bytes);
 
-    msg!("Initialize instruction validated - implementation pending");
+    // Call the initialization logic
+    process_initialize_slab(
+        program_id,
+        slab_account,
+        market_id,
+        lp_owner,
+        router_id,
+        imr,
+        mmr,
+        maker_fee,
+        taker_fee,
+        batch_ms,
+    )?;
+
+    msg!("Slab initialized successfully");
     Ok(())
 }
 
