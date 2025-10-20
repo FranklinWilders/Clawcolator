@@ -8,7 +8,7 @@ use pinocchio::{
     ProgramResult,
 };
 
-use crate::instructions::{RouterInstruction, process_deposit, process_withdraw, process_initialize_registry};
+use crate::instructions::{RouterInstruction, process_deposit, process_withdraw, process_initialize_registry, process_initialize_portfolio, process_initialize_escrow};
 use crate::state::Vault;
 use percolator_common::{PercolatorError, validate_owner, validate_writable, borrow_account_data_mut, InstructionReader};
 
@@ -34,6 +34,8 @@ pub fn process_instruction(
         3 => RouterInstruction::MultiReserve,
         4 => RouterInstruction::MultiCommit,
         5 => RouterInstruction::Liquidate,
+        6 => RouterInstruction::InitializePortfolio,
+        7 => RouterInstruction::InitializeEscrow,
         _ => {
             msg!("Error: Unknown instruction: {}", discriminator);
             return Err(PercolatorError::InvalidInstruction.into());
@@ -65,6 +67,14 @@ pub fn process_instruction(
         RouterInstruction::Liquidate => {
             msg!("Instruction: Liquidate");
             process_liquidate_inner(program_id, accounts, &instruction_data[1..])
+        }
+        RouterInstruction::InitializePortfolio => {
+            msg!("Instruction: InitializePortfolio");
+            process_initialize_portfolio_inner(program_id, accounts, &instruction_data[1..])
+        }
+        RouterInstruction::InitializeEscrow => {
+            msg!("Instruction: InitializeEscrow");
+            process_initialize_escrow_inner(program_id, accounts, &instruction_data[1..])
         }
     }
 }
@@ -252,5 +262,90 @@ fn process_liquidate_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     let _ = data;
 
     msg!("Liquidate instruction validated - implementation pending");
+    Ok(())
+}
+
+/// Process initialize portfolio instruction
+///
+/// Expected accounts:
+/// 0. `[writable]` Portfolio account (PDA)
+/// 1. `[signer]` User
+///
+/// Expected data layout (32 bytes):
+/// - user: Pubkey (32 bytes)
+fn process_initialize_portfolio_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if accounts.len() < 2 {
+        msg!("Error: InitializePortfolio instruction requires at least 2 accounts");
+        return Err(PercolatorError::InvalidInstruction.into());
+    }
+
+    let portfolio_account = &accounts[0];
+    let user_account = &accounts[1];
+
+    // Validate accounts
+    validate_owner(portfolio_account, program_id)?;
+    validate_writable(portfolio_account)?;
+
+    // Parse instruction data - user pubkey
+    let mut reader = InstructionReader::new(data);
+    let user_bytes = reader.read_bytes::<32>()?;
+    let user = Pubkey::from(user_bytes);
+
+    // Verify user signer matches instruction data
+    if user_account.key() != &user {
+        msg!("Error: User account does not match instruction data");
+        return Err(PercolatorError::InvalidAccount.into());
+    }
+
+    // Call the initialization logic
+    process_initialize_portfolio(program_id, portfolio_account, &user)?;
+
+    msg!("Portfolio initialized successfully");
+    Ok(())
+}
+
+/// Process initialize escrow instruction
+///
+/// Expected accounts:
+/// 0. `[writable]` Escrow account (PDA)
+/// 1. `[signer]` User
+///
+/// Expected data layout (96 bytes):
+/// - user: Pubkey (32 bytes)
+/// - slab: Pubkey (32 bytes)
+/// - mint: Pubkey (32 bytes)
+fn process_initialize_escrow_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if accounts.len() < 2 {
+        msg!("Error: InitializeEscrow instruction requires at least 2 accounts");
+        return Err(PercolatorError::InvalidInstruction.into());
+    }
+
+    let escrow_account = &accounts[0];
+    let user_account = &accounts[1];
+
+    // Validate accounts
+    validate_owner(escrow_account, program_id)?;
+    validate_writable(escrow_account)?;
+
+    // Parse instruction data
+    let mut reader = InstructionReader::new(data);
+    let user_bytes = reader.read_bytes::<32>()?;
+    let slab_bytes = reader.read_bytes::<32>()?;
+    let mint_bytes = reader.read_bytes::<32>()?;
+
+    let user = Pubkey::from(user_bytes);
+    let slab = Pubkey::from(slab_bytes);
+    let mint = Pubkey::from(mint_bytes);
+
+    // Verify user signer matches instruction data
+    if user_account.key() != &user {
+        msg!("Error: User account does not match instruction data");
+        return Err(PercolatorError::InvalidAccount.into());
+    }
+
+    // Call the initialization logic
+    process_initialize_escrow(program_id, escrow_account, &user, &slab, &mint)?;
+
+    msg!("Escrow initialized successfully");
     Ok(())
 }
