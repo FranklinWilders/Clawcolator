@@ -68,3 +68,9 @@ impl From<PercolatorError> for u64 {
         e as u64
     }
 }
+
+impl From<PercolatorError> for pinocchio::program_error::ProgramError {
+    fn from(e: PercolatorError) -> Self {
+        pinocchio::program_error::ProgramError::from(e as u64)
+    }
+}

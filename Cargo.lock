@@ -2817,6 +2817,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "percolator-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "percolator-oracle",
+ "percolator-router",
+ "percolator-slab",
+ "solana-program",
+ "solana-program-test",
+ "solana-sdk",
+ "tokio",
+]
+
+[[package]]
 name = "percolator-oracle"
 version = "0.1.0"
 dependencies = [

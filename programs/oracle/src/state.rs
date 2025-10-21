@@ -40,8 +40,8 @@ pub struct PriceOracle {
     /// Price confidence interval (scaled by 1_000_000)
     pub confidence: i64,
 
-    /// Reserved for future use
-    pub _reserved: [u8; 16],
+    /// Reserved for future use (24 bytes to reach 128 total)
+    pub _reserved: [u8; 24],
 }
 
 impl PriceOracle {
@@ -63,7 +63,7 @@ impl PriceOracle {
             price,
             timestamp: 0,
             confidence: 0,
-            _reserved: [0; 16],
+            _reserved: [0; 24],
         }
     }
 

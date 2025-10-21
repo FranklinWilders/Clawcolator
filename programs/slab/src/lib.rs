@@ -1,17 +1,17 @@
-#![no_std]
+#![cfg_attr(target_os = "solana", no_std)]
 
 pub mod state;
 pub mod instructions;
 pub mod pda;
 
-#[cfg(feature = "bpf-entrypoint")]
-mod entrypoint;
+// Always expose entrypoint for testing
+pub mod entrypoint;
 
 #[cfg(test)]
 mod tests;
 
-// Panic handler for no_std builds (not needed in tests)
-#[cfg(not(test))]
+// Panic handler for no_std builds (only for Solana BPF)
+#[cfg(all(target_os = "solana", not(test)))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}

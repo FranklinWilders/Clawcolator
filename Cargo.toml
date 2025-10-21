@@ -5,6 +5,7 @@ members = [
     "programs/slab",
     "programs/oracle",
     "programs/common",
+    "tests/integration",
 ]
 
 [workspace.package]
@@ -24,10 +25,12 @@ solana-sdk = "2.1"
 tokio = { version = "1", features = ["full"] }
 
 [profile.dev]
-panic = "abort"
+# Don't use panic = "abort" for tests
+# panic = "abort"
 
 [profile.release]
-panic = "abort"
+# Don't use panic = "abort" for tests - only for BPF builds
+# panic = "abort"
 lto = "fat"
 codegen-units = 1
 opt-level = 3
@@ -37,3 +40,8 @@ overflow-checks = true
 opt-level = 3
 incremental = false
 codegen-units = 1
+
+# BPF-specific profile (use with cargo build-sbf)
+[profile.sbf]
+inherits = "release"
+panic = "abort"

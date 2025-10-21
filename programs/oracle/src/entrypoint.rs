@@ -5,10 +5,7 @@ use pinocchio::{
     ProgramResult,
 };
 
-mod instructions;
-mod state;
-
-pub use state::{PriceOracle, PRICE_ORACLE_SIZE};
+use crate::instructions;
 
 entrypoint!(process_instruction);
 
