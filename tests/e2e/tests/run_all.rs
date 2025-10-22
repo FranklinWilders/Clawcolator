@@ -4,8 +4,9 @@
 //! and executes the full E2E test plan.
 
 use percolator_e2e_tests::*;
+use solana_sdk::signature::Signer;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn run_all_e2e_tests() {
     println!("\n");
     println!("═══════════════════════════════════════════════════════════");
