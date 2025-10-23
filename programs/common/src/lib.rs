@@ -7,6 +7,7 @@ pub mod account;
 pub mod instruction;
 pub mod header;
 pub mod quote_cache;
+pub mod fill_receipt;
 
 #[cfg(test)]
 mod tests;
@@ -18,3 +19,4 @@ pub use account::*;
 pub use instruction::*;
 pub use header::*;
 pub use quote_cache::*;
+pub use fill_receipt::*;

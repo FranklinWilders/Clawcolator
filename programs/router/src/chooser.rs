@@ -4,7 +4,7 @@
 //! calculates VWAP for the desired quantity, and selects the optimal
 //! execution path (single slab or split across multiple slabs).
 
-use percolator_common::{QuoteCache, QuoteLevel};
+use percolator_common::QuoteCache;
 use pinocchio::pubkey::Pubkey;
 
 /// Quote from a single slab
@@ -171,7 +171,7 @@ pub fn choose_best_sell(quotes: &[SlabQuote], qty: i64) -> Option<usize> {
     best_idx
 }
 
-/// Get quotes from multiple slabs
+/// Get quotes from multiple slabs (test helper only, requires alloc)
 ///
 /// # Arguments
 /// * `caches` - Array of (slab_id, QuoteCache, slab_type) tuples
@@ -180,6 +180,7 @@ pub fn choose_best_sell(quotes: &[SlabQuote], qty: i64) -> Option<usize> {
 ///
 /// # Returns
 /// * Array of SlabQuote
+#[cfg(not(target_os = "solana"))]
 pub fn get_slab_quotes(
     caches: &[(Pubkey, QuoteCache, u8)],
     qty: i64,
