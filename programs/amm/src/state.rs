@@ -164,4 +164,261 @@ mod tests {
 
         assert_eq!(spot, 60_000 * 1_000_000, "Spot price should be 60k scaled");
     }
+
+    #[test]
+    fn test_quote_cache_synthesis() {
+        let header = SlabHeader::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            60_000_000_000,
+            5,
+            1_000_000,
+            255,
+        );
+
+        let mut amm = AmmState::new(header, 1000 * 1_000_000, 60_000_000 * 1_000_000, 5);
+        amm.synthesize_quote_cache();
+
+        // Should have 4 bid and 4 ask levels
+        let cache = &amm.quote_cache;
+
+        // Check that levels are populated (non-zero)
+        for i in 0..4 {
+            assert!(cache.best_bids[i].px > 0, "Bid {} should have price", i);
+            assert!(cache.best_bids[i].avail_qty > 0, "Bid {} should have quantity", i);
+            assert!(cache.best_asks[i].px > 0, "Ask {} should have price", i);
+            assert!(cache.best_asks[i].avail_qty > 0, "Ask {} should have quantity", i);
+        }
+
+        // Bids should be below spot, asks should be above spot
+        let spot = amm.spot_price();
+        for i in 0..4 {
+            assert!(cache.best_bids[i].px < spot, "Bid price should be below spot");
+            assert!(cache.best_asks[i].px > spot, "Ask price should be above spot");
+        }
+    }
+
+    #[test]
+    fn test_quote_cache_ordering() {
+        let header = SlabHeader::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            60_000_000_000,
+            5,
+            1_000_000,
+            255,
+        );
+
+        let mut amm = AmmState::new(header, 1000 * 1_000_000, 60_000_000 * 1_000_000, 5);
+        amm.synthesize_quote_cache();
+
+        let cache = &amm.quote_cache;
+
+        // Bids should be descending (best bid first)
+        for i in 0..3 {
+            assert!(
+                cache.best_bids[i].px >= cache.best_bids[i + 1].px,
+                "Bids should be in descending order"
+            );
+        }
+
+        // Asks should be ascending (best ask first)
+        for i in 0..3 {
+            assert!(
+                cache.best_asks[i].px <= cache.best_asks[i + 1].px,
+                "Asks should be in ascending order"
+            );
+        }
+    }
+
+    #[test]
+    fn test_quote_cache_quantities_increasing() {
+        let header = SlabHeader::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            60_000_000_000,
+            5,
+            1_000_000,
+            255,
+        );
+
+        let mut amm = AmmState::new(header, 1000 * 1_000_000, 60_000_000 * 1_000_000, 5);
+        amm.synthesize_quote_cache();
+
+        let cache = &amm.quote_cache;
+
+        // Quantities should increase (1%, 2%, 5%, 10% of reserves)
+        for i in 0..3 {
+            assert!(
+                cache.best_bids[i].avail_qty < cache.best_bids[i + 1].avail_qty,
+                "Bid quantities should increase"
+            );
+            assert!(
+                cache.best_asks[i].avail_qty < cache.best_asks[i + 1].avail_qty,
+                "Ask quantities should increase"
+            );
+        }
+    }
+
+    #[test]
+    fn test_quote_cache_price_impact() {
+        let header = SlabHeader::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            60_000_000_000,
+            5,
+            1_000_000,
+            255,
+        );
+
+        let mut amm = AmmState::new(header, 1000 * 1_000_000, 60_000_000 * 1_000_000, 5);
+        amm.synthesize_quote_cache();
+
+        let cache = &amm.quote_cache;
+
+        // Price impact should increase with quantity
+        // For asks (buys), prices should increase
+        for i in 0..3 {
+            assert!(
+                cache.best_asks[i].px < cache.best_asks[i + 1].px,
+                "Ask prices should increase with size (higher price impact)"
+            );
+        }
+
+        // For bids (sells), prices should decrease
+        for i in 0..3 {
+            assert!(
+                cache.best_bids[i].px > cache.best_bids[i + 1].px,
+                "Bid prices should decrease with size (worse execution)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_quote_cache_seqno() {
+        let header = SlabHeader::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            60_000_000_000,
+            5,
+            1_000_000,
+            255,
+        );
+
+        let mut amm = AmmState::new(header, 1000 * 1_000_000, 60_000_000 * 1_000_000, 5);
+        amm.synthesize_quote_cache();
+
+        // QuoteCache should capture the seqno from header
+        assert_eq!(amm.quote_cache.seqno_snapshot, amm.header.seqno);
+    }
+
+    #[test]
+    fn test_quote_cache_with_zero_reserves() {
+        let header = SlabHeader::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            60_000_000_000,
+            5,
+            1_000_000,
+            255,
+        );
+
+        let mut amm = AmmState::new(header, 0, 60_000_000 * 1_000_000, 5);
+        amm.synthesize_quote_cache();
+
+        // Should handle zero reserves gracefully (all levels should be zero)
+        let cache = &amm.quote_cache;
+        for i in 0..4 {
+            assert_eq!(cache.best_bids[i].px, 0);
+            assert_eq!(cache.best_asks[i].px, 0);
+        }
+    }
+
+    #[test]
+    fn test_multiple_syntheses() {
+        let header = SlabHeader::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            60_000_000_000,
+            5,
+            1_000_000,
+            255,
+        );
+
+        let mut amm = AmmState::new(header, 1000 * 1_000_000, 60_000_000 * 1_000_000, 5);
+
+        // First synthesis
+        amm.synthesize_quote_cache();
+        let cache1 = amm.quote_cache;
+
+        // Modify reserves
+        amm.pool.x_reserve = 900 * 1_000_000;
+        amm.pool.y_reserve = 66_666_666 * 1_000_000;
+
+        // Second synthesis
+        amm.synthesize_quote_cache();
+        let cache2 = amm.quote_cache;
+
+        // Prices should have changed (spot price changed from 60k to ~74k)
+        assert!(cache2.best_asks[0].px > cache1.best_asks[0].px, "Prices should update");
+    }
+
+    #[test]
+    fn test_spot_price_zero_x() {
+        let header = SlabHeader::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            60_000_000_000,
+            5,
+            1_000_000,
+            255,
+        );
+
+        let amm = AmmState::new(header, 0, 60_000_000 * 1_000_000, 5);
+        let spot = amm.spot_price();
+
+        // Should return 0 instead of panicking
+        assert_eq!(spot, 0);
+    }
+
+    #[test]
+    fn test_different_reserve_scales() {
+        let header = SlabHeader::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            60_000_000_000,
+            5,
+            1_000_000,
+            255,
+        );
+
+        // Small pool
+        let small_amm = AmmState::new(header, 10 * 1_000_000, 600_000 * 1_000_000, 5);
+        let small_spot = small_amm.spot_price();
+
+        // Large pool (100x)
+        let large_amm = AmmState::new(header, 1000 * 1_000_000, 60_000_000 * 1_000_000, 5);
+        let large_spot = large_amm.spot_price();
+
+        // Spot prices should be the same (y/x ratio is the same)
+        assert_eq!(small_spot, large_spot, "Spot price should be scale-independent");
+    }
 }
