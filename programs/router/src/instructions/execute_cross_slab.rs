@@ -1,6 +1,6 @@
 //! Execute cross-slab order - v0 main instruction
 
-use crate::state::{Portfolio, Vault};
+use crate::state::{Portfolio, Vault, SlabRegistry};
 use percolator_common::*;
 use pinocchio::{account_info::AccountInfo, msg, pubkey::Pubkey};
 
@@ -28,6 +28,7 @@ pub struct SlabSplit {
 /// * `portfolio` - User's portfolio account
 /// * `user` - User pubkey (signer)
 /// * `vault` - Collateral vault
+/// * `registry` - Slab registry with insurance state
 /// * `router_authority` - Router authority PDA (for CPI signing)
 /// * `slab_accounts` - Array of slab accounts to execute on
 /// * `receipt_accounts` - Array of receipt PDAs (one per slab)
@@ -35,12 +36,14 @@ pub struct SlabSplit {
 ///
 /// # Returns
 /// * Updates portfolio with net exposures
+/// * Accrues insurance fees from taker fills
 /// * Checks margin on net exposure (capital efficiency!)
 /// * All-or-nothing atomicity
 pub fn process_execute_cross_slab(
     portfolio: &mut Portfolio,
     user: &Pubkey,
     vault: &mut Vault,
+    registry: &mut SlabRegistry,
     router_authority: &AccountInfo,
     slab_accounts: &[AccountInfo],
     receipt_accounts: &[AccountInfo],
@@ -168,6 +171,26 @@ pub fn process_execute_cross_slab(
         };
 
         portfolio.update_exposure(slab_idx, instrument_idx, new_exposure);
+    }
+
+    // Phase 3.5: Accrue insurance fees from taker fills
+    // Calculate total notional across all splits and accrue insurance
+    let mut total_notional: u128 = 0;
+    for split in splits.iter() {
+        // Notional = qty * price (both in 1e6 scale, so divide by 1e6)
+        // For v0 simplified: use limit_px as execution price
+        let notional = ((split.qty.abs() as u128) * (split.limit_px.abs() as u128)) / 1_000_000;
+        total_notional = total_notional.saturating_add(notional);
+    }
+
+    if total_notional > 0 {
+        let accrual = registry.insurance_state.accrue_from_fill(
+            total_notional,
+            &registry.insurance_params,
+        );
+        if accrual > 0 {
+            msg!("Insurance accrued from fills");
+        }
     }
 
     // Phase 4: Calculate IM on net exposure (THE CAPITAL EFFICIENCY PROOF!)

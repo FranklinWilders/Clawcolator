@@ -10,7 +10,7 @@ use pinocchio::{
 
 use crate::instructions::{RouterInstruction, process_deposit, process_withdraw, process_initialize_registry, process_initialize_portfolio, process_execute_cross_slab, process_liquidate_user, process_burn_lp_shares, process_cancel_lp_orders};
 use crate::state::{Vault, Portfolio, SlabRegistry};
-use percolator_common::{PercolatorError, validate_owner, validate_writable, borrow_account_data, borrow_account_data_mut, InstructionReader};
+use percolator_common::{PercolatorError, validate_owner, validate_writable, borrow_account_data_mut, InstructionReader};
 
 entrypoint!(process_instruction);
 
@@ -231,9 +231,10 @@ fn process_initialize_portfolio_inner(program_id: &Pubkey, accounts: &[AccountIn
 /// 0. `[writable]` Portfolio account
 /// 1. `[signer]` User authority
 /// 2. `[writable]` Vault account
-/// 3. `[]` Router authority PDA
-/// 4..4+N. `[writable]` Slab accounts (N = num_splits)
-/// 4+N..4+2N. `[writable]` Receipt PDAs (N = num_splits)
+/// 3. `[writable]` Registry account
+/// 4. `[]` Router authority PDA
+/// 5..5+N. `[writable]` Slab accounts (N = num_splits)
+/// 5+N..5+2N. `[writable]` Receipt PDAs (N = num_splits)
 ///
 /// Instruction data layout:
 /// - num_splits: u8 (1 byte)
@@ -245,25 +246,29 @@ fn process_initialize_portfolio_inner(program_id: &Pubkey, accounts: &[AccountIn
 /// Total size: 1 + (17 * num_splits) bytes
 /// Maximum splits: 8 (to avoid stack overflow)
 fn process_execute_cross_slab_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    if accounts.len() < 4 {
-        msg!("Error: ExecuteCrossSlab requires at least 4 accounts");
+    if accounts.len() < 5 {
+        msg!("Error: ExecuteCrossSlab requires at least 5 accounts");
         return Err(PercolatorError::InvalidInstruction.into());
     }
 
     let portfolio_account = &accounts[0];
     let user_account = &accounts[1];
     let vault_account = &accounts[2];
-    let router_authority = &accounts[3];
+    let registry_account = &accounts[3];
+    let router_authority = &accounts[4];
 
     // Validate accounts
     validate_owner(portfolio_account, program_id)?;
     validate_writable(portfolio_account)?;
     validate_owner(vault_account, program_id)?;
     validate_writable(vault_account)?;
+    validate_owner(registry_account, program_id)?;
+    validate_writable(registry_account)?;
 
     // Borrow account data mutably
     let portfolio = unsafe { borrow_account_data_mut::<Portfolio>(portfolio_account)? };
     let vault = unsafe { borrow_account_data_mut::<Vault>(vault_account)? };
+    let registry = unsafe { borrow_account_data_mut::<SlabRegistry>(registry_account)? };
 
     // Parse instruction data: num_splits (u8) + splits (17 bytes each)
     // Layout per split: side (u8) + qty (i64) + limit_px (i64)
@@ -280,16 +285,16 @@ fn process_execute_cross_slab_inner(program_id: &Pubkey, accounts: &[AccountInfo
         return Err(PercolatorError::InvalidInstruction.into());
     }
 
-    // Verify we have enough accounts: 4 base + num_splits slabs + num_splits receipts
-    let required_accounts = 4 + (num_splits * 2);
+    // Verify we have enough accounts: 5 base + num_splits slabs + num_splits receipts
+    let required_accounts = 5 + (num_splits * 2);
     if accounts.len() < required_accounts {
         msg!("Error: Insufficient accounts for ExecuteCrossSlab");
         return Err(PercolatorError::InvalidInstruction.into());
     }
 
     // Split accounts into slabs and receipts
-    let slab_accounts = &accounts[4..4 + num_splits];
-    let receipt_accounts = &accounts[4 + num_splits..4 + num_splits * 2];
+    let slab_accounts = &accounts[5..5 + num_splits];
+    let receipt_accounts = &accounts[5 + num_splits..5 + num_splits * 2];
 
     // Parse splits from instruction data (on stack, small)
     // Use a fixed-size buffer to avoid heap allocation
@@ -336,6 +341,7 @@ fn process_execute_cross_slab_inner(program_id: &Pubkey, accounts: &[AccountInfo
         portfolio,
         user_account.key(),
         vault,
+        registry,
         router_authority,
         slab_accounts,
         receipt_accounts,
@@ -379,12 +385,13 @@ fn process_liquidate_user_inner(program_id: &Pubkey, accounts: &[AccountInfo], d
     validate_owner(portfolio_account, program_id)?;
     validate_writable(portfolio_account)?;
     validate_owner(registry_account, program_id)?;
+    validate_writable(registry_account)?;
     validate_owner(vault_account, program_id)?;
     validate_writable(vault_account)?;
 
     // Borrow account data mutably
     let portfolio = unsafe { borrow_account_data_mut::<Portfolio>(portfolio_account)? };
-    let registry = unsafe { borrow_account_data::<SlabRegistry>(registry_account)? };
+    let registry = unsafe { borrow_account_data_mut::<SlabRegistry>(registry_account)? };
     let vault = unsafe { borrow_account_data_mut::<Vault>(vault_account)? };
 
     // Parse instruction data

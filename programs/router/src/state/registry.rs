@@ -68,6 +68,12 @@ pub struct SlabRegistry {
     /// Padding for alignment
     pub _padding2: [u8; 8],
 
+    // Insurance fund parameters and state
+    /// Insurance parameters (configurable by governance)
+    pub insurance_params: crate::state::insurance::InsuranceParams,
+    /// Insurance state (runtime tracking)
+    pub insurance_state: crate::state::insurance::InsuranceState,
+
     /// Registered slabs
     pub slabs: [SlabEntry; MAX_SLABS],
 }
@@ -96,6 +102,10 @@ impl SlabRegistry {
         self.min_equity_to_quote = 100_000_000;  // $100 minimum equity
         self.oracle_tolerance_bps = 50;  // 0.5% oracle tolerance
         self._padding2 = [0; 8];
+
+        // Initialize insurance with defaults
+        self.insurance_params = crate::state::insurance::InsuranceParams::default();
+        self.insurance_state = crate::state::insurance::InsuranceState::default();
 
         // Zero out the slabs array using ptr::write_bytes (efficient and stack-safe)
         unsafe {
@@ -126,6 +136,8 @@ impl SlabRegistry {
             min_equity_to_quote: 100_000_000,
             oracle_tolerance_bps: 50,
             _padding2: [0; 8],
+            insurance_params: crate::state::insurance::InsuranceParams::default(),
+            insurance_state: crate::state::insurance::InsuranceState::default(),
             slabs: [SlabEntry {
                 slab_id: Pubkey::default(),
                 version_hash: [0; 32],

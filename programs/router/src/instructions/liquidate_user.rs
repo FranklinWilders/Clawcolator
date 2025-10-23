@@ -60,7 +60,7 @@ pub fn determine_mode(health: i128, preliq_buffer: i128) -> Option<LiquidationMo
 /// * All-or-nothing atomicity
 pub fn process_liquidate_user(
     portfolio: &mut Portfolio,
-    registry: &SlabRegistry,
+    registry: &mut SlabRegistry,
     vault: &mut Vault,
     router_authority: &AccountInfo,
     oracle_accounts: &[AccountInfo],
@@ -212,6 +212,7 @@ pub fn process_liquidate_user(
         portfolio,
         &user_pubkey,
         vault,
+        registry,
         router_authority,
         &slab_accounts[..plan.split_count],
         &receipt_accounts[..plan.split_count],
@@ -224,6 +225,35 @@ pub fn process_liquidate_user(
     portfolio.last_liquidation_ts = current_ts;
 
     msg!("Liquidate: Portfolio updated");
+
+    // Step 7.5: Settle bad debt via insurance fund if equity < 0
+    if portfolio.equity < 0 {
+        let bad_debt = portfolio.equity.abs() as u128;
+
+        // Calculate event notional (sum of liquidation fill notionals)
+        let mut event_notional: u128 = 0;
+        for split in plan.get_splits() {
+            let notional = ((split.qty.abs() as u128) * (split.limit_px.abs() as u128)) / 1_000_000;
+            event_notional = event_notional.saturating_add(notional);
+        }
+
+        let (payout, uncovered) = registry.insurance_state.settle_bad_debt(
+            bad_debt,
+            event_notional,
+            &registry.insurance_params,
+            current_ts,
+        );
+
+        if payout > 0 {
+            // Apply insurance payout to portfolio equity
+            portfolio.equity = portfolio.equity.saturating_add(payout as i128);
+            msg!("Insurance payout applied to cover bad debt");
+        }
+
+        if uncovered > 0 {
+            msg!("Warning: Uncovered bad debt remains after insurance payout");
+        }
+    }
 
     // Step 8: Emit liquidation events (simplified for v0)
     // In production, emit LiquidationStart, LiquidationFill, LiquidationEnd
@@ -297,6 +327,8 @@ mod tests {
             min_equity_to_quote: 100_000_000,
             oracle_tolerance_bps: 50,
             _padding2: [0; 8],
+            insurance_params: crate::state::insurance::InsuranceParams::default(),
+            insurance_state: crate::state::insurance::InsuranceState::default(),
             slabs: [SlabEntry {
                 slab_id: Pubkey::default(),
                 version_hash: [0; 32],
