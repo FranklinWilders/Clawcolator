@@ -8,7 +8,7 @@ use pinocchio::{
     ProgramResult,
 };
 
-use crate::instructions::{RouterInstruction, process_deposit, process_withdraw, process_initialize_registry, process_initialize_portfolio, process_execute_cross_slab, process_liquidate_user};
+use crate::instructions::{RouterInstruction, process_deposit, process_withdraw, process_initialize_registry, process_initialize_portfolio, process_execute_cross_slab, process_liquidate_user, process_burn_lp_shares, process_cancel_lp_orders};
 use crate::state::{Vault, Portfolio, SlabRegistry};
 use percolator_common::{PercolatorError, validate_owner, validate_writable, borrow_account_data, borrow_account_data_mut, InstructionReader};
 
@@ -34,6 +34,8 @@ pub fn process_instruction(
         3 => RouterInstruction::Withdraw,
         4 => RouterInstruction::ExecuteCrossSlab,
         5 => RouterInstruction::LiquidateUser,
+        6 => RouterInstruction::BurnLpShares,
+        7 => RouterInstruction::CancelLpOrders,
         _ => {
             msg!("Error: Unknown instruction");
             return Err(PercolatorError::InvalidInstruction.into());
@@ -65,6 +67,14 @@ pub fn process_instruction(
         RouterInstruction::LiquidateUser => {
             msg!("Instruction: LiquidateUser");
             process_liquidate_user_inner(program_id, accounts, &instruction_data[1..])
+        }
+        RouterInstruction::BurnLpShares => {
+            msg!("Instruction: BurnLpShares");
+            process_burn_lp_shares_inner(program_id, accounts, &instruction_data[1..])
+        }
+        RouterInstruction::CancelLpOrders => {
+            msg!("Instruction: CancelLpOrders");
+            process_cancel_lp_orders_inner(program_id, accounts, &instruction_data[1..])
         }
     }
 }
@@ -415,5 +425,134 @@ fn process_liquidate_user_inner(program_id: &Pubkey, accounts: &[AccountInfo], d
     )?;
 
     msg!("LiquidateUser processed successfully");
+    Ok(())
+}
+
+/// Process burn LP shares instruction
+///
+/// Expected accounts:
+/// 0. `[writable]` Portfolio account
+/// 1. `[signer]` User authority
+///
+/// Instruction data layout:
+/// - market_id: Pubkey (32 bytes)
+/// - shares_to_burn: u64 (8 bytes)
+/// - current_share_price: i64 (8 bytes)
+/// - current_ts: u64 (8 bytes)
+/// - max_staleness_seconds: u64 (8 bytes)
+///
+/// Total size: 64 bytes
+fn process_burn_lp_shares_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if accounts.len() < 2 {
+        msg!("Error: BurnLpShares requires at least 2 accounts");
+        return Err(PercolatorError::InvalidInstruction.into());
+    }
+
+    let portfolio_account = &accounts[0];
+    let _user_account = &accounts[1];
+
+    // Validate accounts
+    validate_owner(portfolio_account, program_id)?;
+    validate_writable(portfolio_account)?;
+
+    // Borrow account data mutably
+    let portfolio = unsafe { borrow_account_data_mut::<Portfolio>(portfolio_account)? };
+
+    // Parse instruction data
+    if data.len() < 64 {
+        msg!("Error: Instruction data too short");
+        return Err(PercolatorError::InvalidInstruction.into());
+    }
+
+    let mut reader = InstructionReader::new(data);
+    let market_id_bytes = reader.read_bytes::<32>()?;
+    let market_id = Pubkey::from(market_id_bytes);
+    let shares_to_burn = reader.read_u64()?;
+    let current_share_price = reader.read_i64()?;
+    let current_ts = reader.read_u64()?;
+    let max_staleness_seconds = reader.read_u64()?;
+
+    // Call the instruction handler
+    process_burn_lp_shares(
+        portfolio,
+        market_id,
+        shares_to_burn,
+        current_share_price,
+        current_ts,
+        max_staleness_seconds,
+    )?;
+
+    msg!("BurnLpShares processed successfully");
+    Ok(())
+}
+
+/// Process cancel LP orders instruction
+///
+/// Expected accounts:
+/// 0. `[writable]` Portfolio account
+/// 1. `[signer]` User authority
+///
+/// Instruction data layout:
+/// - market_id: Pubkey (32 bytes)
+/// - order_count: u8 (1 byte)
+/// - order_ids: [u64; order_count] (8 * order_count bytes)
+/// - freed_quote: u128 (16 bytes)
+/// - freed_base: u128 (16 bytes)
+///
+/// Total size: 65 + (8 * order_count) bytes
+fn process_cancel_lp_orders_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if accounts.len() < 2 {
+        msg!("Error: CancelLpOrders requires at least 2 accounts");
+        return Err(PercolatorError::InvalidInstruction.into());
+    }
+
+    let portfolio_account = &accounts[0];
+    let _user_account = &accounts[1];
+
+    // Validate accounts
+    validate_owner(portfolio_account, program_id)?;
+    validate_writable(portfolio_account)?;
+
+    // Borrow account data mutably
+    let portfolio = unsafe { borrow_account_data_mut::<Portfolio>(portfolio_account)? };
+
+    // Parse instruction data
+    if data.len() < 65 {
+        msg!("Error: Instruction data too short");
+        return Err(PercolatorError::InvalidInstruction.into());
+    }
+
+    let mut reader = InstructionReader::new(data);
+    let market_id_bytes = reader.read_bytes::<32>()?;
+    let market_id = Pubkey::from(market_id_bytes);
+    let order_count = reader.read_u8()? as usize;
+
+    // Read order IDs (up to 16 max for stack safety)
+    const MAX_ORDERS: usize = 16;
+    if order_count > MAX_ORDERS {
+        msg!("Error: order_count exceeds maximum");
+        return Err(PercolatorError::InvalidInstruction.into());
+    }
+
+    let mut order_ids_buffer = [0u64; MAX_ORDERS];
+    for i in 0..order_count {
+        order_ids_buffer[i] = reader.read_u64()?;
+    }
+    let order_ids = &order_ids_buffer[..order_count];
+
+    let freed_quote = reader.read_u128()?;
+    let freed_base = reader.read_u128()?;
+
+    // Call the instruction handler
+    process_cancel_lp_orders(
+        portfolio,
+        market_id,
+        order_ids,
+        order_count,
+        freed_quote,
+        freed_base,
+    )?;
+
+    msg!("CancelLpOrders processed successfully");
     Ok(())
 }

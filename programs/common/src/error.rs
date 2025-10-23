@@ -27,6 +27,9 @@ pub enum PercolatorError {
     CpiFailed = 109,
     PortfolioHealthy = 110,
     LiquidationCooldown = 111,
+    InvalidAmount = 112,
+    InsufficientBalance = 113,
+    StalePrice = 114,
 
     // Slab errors (200-299)
     InvalidInstrument = 200,

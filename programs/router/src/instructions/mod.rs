@@ -6,6 +6,8 @@ pub mod deposit;
 pub mod withdraw;
 pub mod execute_cross_slab;
 pub mod liquidate_user;
+pub mod burn_lp_shares;
+pub mod cancel_lp_orders;
 
 pub use initialize::*;
 pub use initialize_portfolio::*;
@@ -13,6 +15,8 @@ pub use deposit::*;
 pub use withdraw::*;
 pub use execute_cross_slab::*;
 pub use liquidate_user::*;
+pub use burn_lp_shares::*;
+pub use cancel_lp_orders::*;
 
 /// Instruction discriminator (v0 minimal)
 #[repr(u8)]
@@ -30,6 +34,10 @@ pub enum RouterInstruction {
     ExecuteCrossSlab = 4,
     /// Liquidate user positions (reduce-only)
     LiquidateUser = 5,
+    /// Burn AMM LP shares (ONLY way to reduce AMM LP exposure)
+    BurnLpShares = 6,
+    /// Cancel Slab LP orders (ONLY way to reduce Slab LP exposure)
+    CancelLpOrders = 7,
 }
 
 // Note: Instruction dispatching is handled in entrypoint.rs
