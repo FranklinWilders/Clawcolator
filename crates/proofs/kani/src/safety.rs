@@ -1,7 +1,7 @@
 //! Kani safety proofs for all 6 invariants
 
-use kani::{any, assume, Arbitrary};
-use model_safety::{state::*, helpers::*, transitions::*};
+use kani::{any, assume};
+use model_safety::{helpers::*, transitions::*};
 use crate::{adversary::*, sanitizer::*, generators::*};
 
 /// I1: Principal Inviolability
@@ -38,7 +38,7 @@ fn i2_conservation_holds_across_short_adversary_sequences() {
 
     // Run adversarial sequence
     let mut steps: u8 = any();
-    steps = (steps % sanitizer::MAX_STEPS) + 1;
+    steps = (steps % MAX_STEPS) + 1;
 
     for _ in 0..steps {
         s = adversary_step(s);
@@ -119,7 +119,6 @@ fn i5_withdraw_throttle_safety() {
     };
 
     // Calculate warm-up cap
-    use crate::sanitizer::MAX_STEPS;
     let max_allowed = (step as u128).saturating_mul(before.users[uid].warmup_state.slope_per_step);
 
     // Actual withdrawal should not exceed warm-up cap
