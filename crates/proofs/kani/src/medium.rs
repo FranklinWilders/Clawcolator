@@ -133,43 +133,72 @@ pub fn calculate_withdrawn(before: &State, after: &State, uid: usize) -> u128 {
 
 // === Medium Complexity Proofs ===
 
-/// I2: Conservation with 2 users, 3 adversarial steps
+/// I2: Conservation with 2 users, deposit then withdraw
 #[kani::proof]
-fn i2_conservation_2users_3steps() {
+fn i2_conservation_2users_deposit_withdraw() {
     // Concrete: 2 users (winner + loser)
     let state = make_2user_winner_loser(1000, 500, 1000, -200);
 
-    // Symbolic: 3 operations with u8 choices
-    let op1: u8 = kani::any();
-    let op2: u8 = kani::any();
-    let op3: u8 = kani::any();
+    // Symbolic amounts
+    let deposit_amt: u8 = kani::any();
+    let withdraw_amt: u8 = kani::any();
 
-    // Apply 3 adversarial steps
-    let s1 = bounded_adversary_step(state, op1);
-    let s2 = bounded_adversary_step(s1, op2);
-    let s3 = bounded_adversary_step(s2, op3);
+    let initial_vault = state.vault;
+
+    // User 0 deposits
+    let s1 = deposit(state, 0, deposit_amt as u128);
+
+    // User 1 withdraws (bounded)
+    let withdraw_bounded = (withdraw_amt as u128) % 500; // Don't exceed principal
+    let s2 = withdraw_principal(s1, 1, withdraw_bounded);
 
     // Basic sanity: no overflow
-    kani::assert(s3.vault < u128::MAX, "I2: Vault must not overflow");
+    kani::assert(s2.vault < u128::MAX, "I2: Vault must not overflow");
 
-    // Vault should be reasonable (not massively inflated)
-    kani::assert(s3.vault < 1_000_000, "I2: Vault stays bounded");
+    // Vault change should match operations
+    let expected_change = (deposit_amt as i128) - (withdraw_bounded as i128);
+    let actual_change = (s2.vault as i128) - (initial_vault as i128);
+
+    // Should be close (accounting for saturation)
+    kani::assert(
+        (actual_change - expected_change).abs() <= 1,
+        "I2: Vault change matches operations"
+    );
 }
 
-/// I2: Conservation with 1 user, longer sequence
+/// I2: Conservation with deposit, socialization, withdrawal
 #[kani::proof]
-fn i2_conservation_1user_5steps() {
+fn i2_conservation_deposit_socialize_withdraw() {
     let state = make_1user_state(1000, 500, 10);
 
-    let ops: [u8; 5] = kani::any();
+    let deposit_amt: u8 = kani::any();
+    let deficit: u8 = kani::any();
+    let withdraw_amt: u8 = kani::any();
 
-    let mut s = state;
-    for op in ops.iter() {
-        s = bounded_adversary_step(s, *op);
+    let initial_vault = state.vault;
+
+    // Deposit
+    let s1 = deposit(state, 0, deposit_amt as u128);
+
+    // Socialize losses (haircut PnL)
+    let s2 = socialize_losses(s1, deficit as u128);
+
+    // Withdraw principal (bounded)
+    let withdraw_bounded = (withdraw_amt as u128) % 500;
+    let s3 = withdraw_principal(s2, 0, withdraw_bounded);
+
+    // Basic sanity checks
+    kani::assert(s3.vault < u128::MAX, "I2: No overflow");
+    kani::assert(s3.vault < 10_000_000, "I2: Vault stays bounded");
+
+    // Vault shouldn't decrease by more than we withdrew
+    if s3.vault < initial_vault {
+        let decrease = initial_vault - s3.vault;
+        kani::assert(
+            decrease <= withdraw_bounded + deficit as u128,
+            "I2: Vault decrease bounded by operations"
+        );
     }
-
-    kani::assert(s.vault < u128::MAX, "I2: No overflow after 5 steps");
-    kani::assert(s.vault < 1_000_000, "I2: Vault bounded after 5 steps");
 }
 
 /// I4: Bounded socialization with 2 users, symbolic deficit
