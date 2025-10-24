@@ -290,30 +290,44 @@ impl Portfolio {
         Err(())
     }
 
-    /// Calculate total maintenance margin (venue-aware)
+    /// Calculate total maintenance margin (venue-aware, using verified math)
     /// MM_total = MM_principal + Σ MM_bucket_i
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified saturating addition from model_safety::math
+    /// to prevent overflow bugs in margin calculations.
     pub fn calculate_total_mm(&self) -> u128 {
+        use model_safety::math::add_u128;
+
         let mut total_mm = self.mm; // Principal MM
 
-        // Add LP bucket MMs
+        // Add LP bucket MMs using verified addition
         for i in 0..self.lp_bucket_count as usize {
             if self.lp_buckets[i].active {
-                total_mm = total_mm.saturating_add(self.lp_buckets[i].mm);
+                total_mm = add_u128(total_mm, self.lp_buckets[i].mm);
             }
         }
 
         total_mm
     }
 
-    /// Calculate total initial margin (venue-aware)
+    /// Calculate total initial margin (venue-aware, using verified math)
     /// IM_total = IM_principal + Σ IM_bucket_i
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified saturating addition from model_safety::math
+    /// to prevent overflow bugs in margin calculations.
     pub fn calculate_total_im(&self) -> u128 {
+        use model_safety::math::add_u128;
+
         let mut total_im = self.im; // Principal IM
 
-        // Add LP bucket IMs
+        // Add LP bucket IMs using verified addition
         for i in 0..self.lp_bucket_count as usize {
             if self.lp_buckets[i].active {
-                total_im = total_im.saturating_add(self.lp_buckets[i].im);
+                total_im = add_u128(total_im, self.lp_buckets[i].im);
             }
         }
 

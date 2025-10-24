@@ -448,4 +448,55 @@ mod tests {
 
         assert!(!check_conservation(&portfolios, &registry, total_vault, total_fees));
     }
+
+    /// Example: Conservation check in a typical test scenario
+    ///
+    /// This demonstrates the recommended pattern for adding conservation checks
+    /// to production tests. Add this pattern to all state-mutating tests.
+    #[test]
+    fn test_conservation_example_deposit_withdraw() {
+        let registry = SlabRegistry::new(Pubkey::default(), Pubkey::default(), 0);
+
+        // Initial state: User deposits 100M
+        let mut p1 = Portfolio::new(Pubkey::default(), Pubkey::default(), 0);
+        p1.principal = 100_000_000;
+        p1.pnl = 0;
+
+        let mut portfolios = vec![p1];
+        let mut total_vault = 100_000_000;
+        let total_fees = 0;
+
+        // ✅ Conservation check after deposit
+        assert!(
+            check_conservation(&portfolios, &registry, total_vault, total_fees),
+            "Conservation violated after deposit"
+        );
+
+        // User realizes profit: +20M PnL
+        portfolios[0].pnl = 20_000_000;
+        total_vault += 20_000_000; // Vault increases by profit
+
+        // ✅ Conservation check after profit
+        assert!(
+            check_conservation(&portfolios, &registry, total_vault, total_fees),
+            "Conservation violated after profit"
+        );
+
+        // User withdraws 20M (all vested profit, no principal touched)
+        portfolios[0].pnl = 0; // All PnL withdrawn
+        total_vault -= 20_000_000;
+
+        // ✅ Conservation check after withdrawal
+        // vault = principal + max(0, pnl) + insurance + fees
+        // 100M = 100M + 0 + 0 + 0 ✓
+        assert!(
+            check_conservation(&portfolios, &registry, total_vault, total_fees),
+            "Conservation violated after withdrawal"
+        );
+
+        // Final state verification
+        assert_eq!(portfolios[0].principal, 100_000_000); // Principal unchanged
+        assert_eq!(portfolios[0].pnl, 0); // PnL fully withdrawn
+        assert_eq!(total_vault, 100_000_000); // Vault = principal only
+    }
 }

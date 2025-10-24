@@ -66,3 +66,13 @@ pub fn min_u128(a: u128, b: u128) -> u128 {
 pub fn max_u128(a: u128, b: u128) -> u128 {
     if a > b { a } else { b }
 }
+
+/// Minimum of two i128
+pub fn min_i128(a: i128, b: i128) -> i128 {
+    if a < b { a } else { b }
+}
+
+/// Maximum of two i128
+pub fn max_i128(a: i128, b: i128) -> i128 {
+    if a > b { a } else { b }
+}

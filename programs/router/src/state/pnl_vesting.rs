@@ -252,7 +252,7 @@ pub fn on_user_touch(
     }
 }
 
-/// Calculate required global haircut to cover shortfall
+/// Calculate required global haircut to cover shortfall (using verified math)
 ///
 /// Called after insurance fund is exhausted and bad debt remains.
 /// Computes haircut fraction based on total positive PnL across all users.
@@ -265,28 +265,44 @@ pub fn on_user_touch(
 /// # Returns
 /// Haircut fraction h in [0, 1] fixed-point (1e9 scale)
 /// Users keep: new_pnl = old_pnl * h
+///
+/// # Safety
+///
+/// Uses formally verified arithmetic from model_safety::math to prevent
+/// overflow/underflow bugs in haircut calculations.
 pub fn calculate_haircut_fraction(
     shortfall: u128,
     total_positive_pnl: u128,
     max_haircut_bps: u16,
 ) -> i128 {
+    use model_safety::math::{mul_u128, div_u128, u128_to_i128, sub_i128, min_i128};
+
     if total_positive_pnl == 0 || shortfall == 0 {
         return FP_ONE; // No haircut needed
     }
 
     // Haircut fraction to REMOVE: haircut = min(1, shortfall / total_positive_pnl)
+    // Use verified math to prevent overflow
     let haircut_raw = if shortfall >= total_positive_pnl {
         FP_ONE // 100% haircut (zero out all PnL)
     } else {
-        ((shortfall as i128) * FP_ONE) / (total_positive_pnl as i128)
+        // Calculate: (shortfall * FP_ONE) / total_positive_pnl
+        let numerator = mul_u128(shortfall, FP_ONE as u128);
+        let fraction = div_u128(numerator, total_positive_pnl);
+        u128_to_i128(fraction)
     };
 
-    // Cap by max_haircut_bps
-    let max_haircut_fp = ((max_haircut_bps as i128) * FP_ONE) / 10_000;
-    let haircut = haircut_raw.min(max_haircut_fp);
+    // Cap by max_haircut_bps using verified arithmetic
+    // max_haircut_fp = (max_haircut_bps * FP_ONE) / 10_000
+    let max_haircut_numerator = mul_u128(max_haircut_bps as u128, FP_ONE as u128);
+    let max_haircut_fp = u128_to_i128(div_u128(max_haircut_numerator, 10_000));
 
-    // Return fraction to KEEP: h = 1 - haircut
-    FP_ONE - haircut
+    // haircut = min(haircut_raw, max_haircut_fp)
+    let haircut = min_i128(haircut_raw, max_haircut_fp);
+
+    // Return fraction to KEEP: h = FP_ONE - haircut
+    // Use verified subtraction
+    sub_i128(FP_ONE, haircut)
 }
 
 #[cfg(test)]
