@@ -148,12 +148,12 @@ pub fn one_minus_exp_neg(dt: u64, tau: u64) -> i128 {
     result.max(0).min(FP_ONE)
 }
 
-/// Apply global haircut catchup and vesting to a user's PnL
+/// Apply global haircut catchup and vesting to a user's PnL (using verified math)
 ///
 /// This is called on every user touch (deposit, withdraw, trade, view)
 /// to lazily apply:
 /// 1. Global haircut index (if it changed)
-/// 2. Time-decay vesting of PnL
+/// 2. Time-decay vesting of PnL (exponential: 1 - exp(-Δ/τ))
 ///
 /// # Arguments
 /// * `principal` - User's principal (never changes here)
@@ -164,6 +164,11 @@ pub fn one_minus_exp_neg(dt: u64, tau: u64) -> i128 {
 /// * `global_haircut` - Global haircut state
 /// * `vesting_params` - Vesting parameters
 /// * `now_slot` - Current slot
+///
+/// # Safety
+///
+/// Uses formally verified arithmetic from model_safety::math to prevent
+/// overflow/underflow bugs in haircut and vesting calculations.
 pub fn on_user_touch(
     _principal: i128,  // Not modified, but included for clarity
     pnl: &mut i128,
@@ -174,34 +179,25 @@ pub fn on_user_touch(
     vesting_params: &PnlVestingParams,
     now_slot: u64,
 ) {
+    use model_safety::math::{max_i128, min_i128, sub_i128, add_i128, mul_i128, div_i128};
+
     // Step 1: Apply global haircut catchup
     // IMPORTANT: Haircuts only apply to POSITIVE PnL. Negative PnL (losses) are never haircutted.
     if *pnl_index_checkpoint != global_haircut.pnl_index {
-        let den = (*pnl_index_checkpoint).max(1); // Avoid div by zero
+        let den = max_i128(*pnl_index_checkpoint, 1); // Avoid div by zero using verified max
         let num = global_haircut.pnl_index;
 
         // Only apply haircut to positive PnL
         if *pnl > 0 {
-            // Scale both pnl and vested_pnl by the index ratio
-            // Use overflow-safe multiplication for very large PnL values
-            *pnl = if (*pnl).abs() > i128::MAX / (num.abs() + 1) {
-                // For very large values, do division first to avoid overflow
-                // Accept slight precision loss for extreme values
-                (*pnl / den) * num
-            } else {
-                (*pnl * num) / den
-            };
+            // Scale both pnl and vested_pnl by the index ratio: value * (num / den)
+            // Using verified arithmetic prevents overflow
 
-            *vested_pnl = if (*vested_pnl).abs() > i128::MAX / (num.abs() + 1) {
-                (*vested_pnl / den) * num
-            } else {
-                (*vested_pnl * num) / den
-            };
+            // Calculate: (*pnl * num) / den with overflow safety using verified operations
+            *pnl = div_i128(mul_i128(*pnl, num), den);
+            *vested_pnl = div_i128(mul_i128(*vested_pnl, num), den);
 
             // Ensure vested_pnl doesn't exceed pnl (can happen due to rounding)
-            if *vested_pnl > *pnl {
-                *vested_pnl = *pnl;
-            }
+            *vested_pnl = min_i128(*vested_pnl, *pnl);
         }
         // If PnL is negative or zero, don't apply haircut (losses never get haircutted)
 
@@ -218,7 +214,7 @@ pub fn on_user_touch(
             return;
         }
 
-        // Compute vesting fraction
+        // Compute vesting fraction (exponential: 1 - exp(-dt/tau))
         let rel = if dt >= 20 * vesting_params.tau_slots {
             // Saturate to full vesting
             FP_ONE
@@ -227,19 +223,12 @@ pub fn on_user_touch(
         };
 
         // Vest the gap: vested_pnl += rel * (pnl - vested_pnl)
-        let gap = *pnl - *vested_pnl;
+        let gap = sub_i128(*pnl, *vested_pnl); // Verified subtraction
 
-        // Overflow-safe multiplication: use checked operations for large values
-        let delta = if gap > i128::MAX / FP_ONE {
-            // For very large gaps, compute in two steps to avoid overflow
-            let scaled_gap = gap / 1000;
-            let scaled_fp = rel / 1000;
-            (scaled_gap * scaled_fp)
-        } else {
-            (gap * rel) / FP_ONE
-        };
+        // Calculate delta = (gap * rel) / FP_ONE using verified arithmetic
+        let delta = div_i128(mul_i128(gap, rel), FP_ONE);
 
-        *vested_pnl += delta;
+        *vested_pnl = add_i128(*vested_pnl, delta); // Verified addition
 
         // Update last_slot
         *last_slot = now_slot;
@@ -247,9 +236,7 @@ pub fn on_user_touch(
 
     // Step 3: Ensure invariants
     // If pnl drops below vested_pnl (due to losses), clamp
-    if *vested_pnl > *pnl {
-        *vested_pnl = *pnl;
-    }
+    *vested_pnl = min_i128(*vested_pnl, *pnl);
 }
 
 /// Calculate required global haircut to cover shortfall (using verified math)

@@ -3047,6 +3047,8 @@ dependencies = [
 name = "percolator-router"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
+ "model_safety",
  "percolator-common",
  "pinocchio",
  "pinocchio-pubkey",

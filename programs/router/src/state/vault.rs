@@ -27,35 +27,62 @@ impl Vault {
     pub const LEN: usize = core::mem::size_of::<Self>();
 
     /// Get available balance (not pledged)
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified arithmetic to prevent underflow.
     pub fn available(&self) -> u128 {
-        self.balance.saturating_sub(self.total_pledged)
+        use model_safety::math::sub_u128;
+        sub_u128(self.balance, self.total_pledged)
     }
 
     /// Pledge amount to escrow
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified arithmetic to prevent overflow.
     pub fn pledge(&mut self, amount: u128) -> Result<(), ()> {
+        use model_safety::math::add_u128;
+
         if self.available() < amount {
             return Err(());
         }
-        self.total_pledged = self.total_pledged.saturating_add(amount);
+        self.total_pledged = add_u128(self.total_pledged, amount);
         Ok(())
     }
 
     /// Unpledge amount from escrow
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified arithmetic to prevent underflow.
     pub fn unpledge(&mut self, amount: u128) {
-        self.total_pledged = self.total_pledged.saturating_sub(amount);
+        use model_safety::math::sub_u128;
+        self.total_pledged = sub_u128(self.total_pledged, amount);
     }
 
     /// Deposit to vault
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified arithmetic to prevent overflow.
     pub fn deposit(&mut self, amount: u128) {
-        self.balance = self.balance.saturating_add(amount);
+        use model_safety::math::add_u128;
+        self.balance = add_u128(self.balance, amount);
     }
 
     /// Withdraw from vault
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified arithmetic to prevent underflow.
     pub fn withdraw(&mut self, amount: u128) -> Result<(), ()> {
+        use model_safety::math::sub_u128;
+
         if self.available() < amount {
             return Err(());
         }
-        self.balance = self.balance.saturating_sub(amount);
+        self.balance = sub_u128(self.balance, amount);
         Ok(())
     }
 }

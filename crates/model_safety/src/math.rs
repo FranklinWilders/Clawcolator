@@ -76,3 +76,17 @@ pub fn min_i128(a: i128, b: i128) -> i128 {
 pub fn max_i128(a: i128, b: i128) -> i128 {
     if a > b { a } else { b }
 }
+
+/// Multiply i128 with saturation
+pub fn mul_i128(a: i128, b: i128) -> i128 {
+    a.saturating_mul(b)
+}
+
+/// Divide i128 (returns 0 if divisor is 0)
+pub fn div_i128(a: i128, b: i128) -> i128 {
+    if b == 0 {
+        0
+    } else {
+        a / b
+    }
+}

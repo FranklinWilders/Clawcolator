@@ -205,17 +205,31 @@ impl Portfolio {
         0
     }
 
-    /// Update margin requirements
+    /// Update margin requirements (using verified math)
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified arithmetic to prevent overflow/underflow.
     pub fn update_margin(&mut self, im: u128, mm: u128) {
+        use model_safety::math::{u128_to_i128, sub_i128};
+
         self.im = im;
         self.mm = mm;
-        self.free_collateral = self.equity.saturating_sub(im as i128);
+        // Convert im to i128 and subtract from equity using verified operations
+        self.free_collateral = sub_i128(self.equity, u128_to_i128(im));
     }
 
-    /// Update equity
+    /// Update equity (using verified math)
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified arithmetic to prevent overflow/underflow.
     pub fn update_equity(&mut self, equity: i128) {
+        use model_safety::math::{u128_to_i128, sub_i128};
+
         self.equity = equity;
-        self.free_collateral = equity.saturating_sub(self.im as i128);
+        // Convert im to i128 and subtract from equity using verified operations
+        self.free_collateral = sub_i128(equity, u128_to_i128(self.im));
     }
 
     /// Check if sufficient margin

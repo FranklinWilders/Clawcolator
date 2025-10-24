@@ -143,54 +143,72 @@ impl InsuranceState {
             self.day_start_vault_balance = self.vault_balance;
         }
 
-        // Calculate caps (use day-start vault balance for daily cap)
-        let daily_cap =
-            (self.day_start_vault_balance * params.max_daily_payout_bps_of_vault as u128) / 10_000;
-        let remaining_daily = daily_cap.saturating_sub(self.daily_payout_accum);
+        use model_safety::math::{mul_u128, div_u128, sub_u128, add_u128, min_u128};
 
-        let per_event_cap = (event_notional * params.max_payout_bps_of_oi as u128) / 10_000;
+        // Calculate caps (use day-start vault balance for daily cap)
+        let daily_cap_numerator = mul_u128(
+            self.day_start_vault_balance,
+            params.max_daily_payout_bps_of_vault as u128,
+        );
+        let daily_cap = div_u128(daily_cap_numerator, 10_000);
+        let remaining_daily = sub_u128(daily_cap, self.daily_payout_accum);
+
+        let per_event_cap_numerator = mul_u128(event_notional, params.max_payout_bps_of_oi as u128);
+        let per_event_cap = div_u128(per_event_cap_numerator, 10_000);
 
         // Max allowed payout is minimum of: vault balance, per-event cap, remaining daily cap
-        let max_allowed = self
-            .vault_balance
-            .min(per_event_cap)
-            .min(remaining_daily);
+        let max_allowed = min_u128(
+            min_u128(self.vault_balance, per_event_cap),
+            remaining_daily,
+        );
 
         // Actual payout is minimum of bad debt and max allowed
-        let payout = bad_debt.min(max_allowed);
+        let payout = min_u128(bad_debt, max_allowed);
 
-        // Update state
+        // Update state using verified arithmetic
         if payout > 0 {
-            self.vault_balance = self.vault_balance.saturating_sub(payout);
-            self.daily_payout_accum = self.daily_payout_accum.saturating_add(payout);
-            self.total_payouts = self.total_payouts.saturating_add(payout);
+            self.vault_balance = sub_u128(self.vault_balance, payout);
+            self.daily_payout_accum = add_u128(self.daily_payout_accum, payout);
+            self.total_payouts = add_u128(self.total_payouts, payout);
             self.last_payout_ts = now;
         }
 
         // Calculate uncovered amount
-        let uncovered = bad_debt.saturating_sub(payout);
+        let uncovered = sub_u128(bad_debt, payout);
         if uncovered > 0 {
-            self.uncovered_bad_debt = self.uncovered_bad_debt.saturating_add(uncovered);
+            self.uncovered_bad_debt = add_u128(self.uncovered_bad_debt, uncovered);
         }
 
         (payout, uncovered)
     }
 
     /// Manual top-up of insurance vault (governance only)
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified arithmetic to prevent overflow.
     pub fn top_up(&mut self, amount: u128) {
-        self.vault_balance = self.vault_balance.saturating_add(amount);
-        self.total_fees_accrued = self.total_fees_accrued.saturating_add(amount);
+        use model_safety::math::add_u128;
+
+        self.vault_balance = add_u128(self.vault_balance, amount);
+        self.total_fees_accrued = add_u128(self.total_fees_accrued, amount);
     }
 
     /// Withdraw surplus (governance only, requires uncovered_bad_debt == 0)
+    ///
+    /// # Safety
+    ///
+    /// Uses formally verified arithmetic to prevent underflow.
     pub fn withdraw_surplus(&mut self, amount: u128) -> Result<(), ()> {
+        use model_safety::math::sub_u128;
+
         if self.uncovered_bad_debt > 0 {
             return Err(()); // Cannot withdraw while there's uncovered debt
         }
         if self.vault_balance < amount {
             return Err(()); // Insufficient balance
         }
-        self.vault_balance = self.vault_balance.saturating_sub(amount);
+        self.vault_balance = sub_u128(self.vault_balance, amount);
         Ok(())
     }
 }
