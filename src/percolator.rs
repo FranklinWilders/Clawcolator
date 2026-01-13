@@ -3649,8 +3649,9 @@ impl RiskEngine {
             loss_to_socialize
         );
 
-        // Haircuts reduce claims (net_pnl) to cover the loss. No insurance credit needed.
-        // Conservation: actual stays same, expected decreases by haircut amount (slack grows).
+        // Haircuts reduce user PnL claims to cover the loss. The reduced claims
+        // represent value that stays in the vault (not extracted by winners).
+        // No insurance credit needed - this is a zero-sum reallocation of claims.
 
         // Handle remaining loss with insurance fund (respecting floor)
         // remaining_loss = total_loss - loss_to_socialize (what couldn't be haircutted)
@@ -3797,8 +3798,9 @@ impl RiskEngine {
             loss_to_socialize
         );
 
-        // Haircuts reduce claims (net_pnl) to cover the loss. No insurance credit needed.
-        // Conservation: actual stays same, expected decreases by haircut amount (slack grows).
+        // Haircuts reduce user PnL claims to cover the loss. The reduced claims
+        // represent value that stays in the vault (not extracted by winners).
+        // No insurance credit needed - this is a zero-sum reallocation of claims.
 
         // Handle remaining loss with insurance fund (respecting floor)
         // remaining_loss = total_loss - loss_to_socialize (what couldn't be haircutted)
