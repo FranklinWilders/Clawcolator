@@ -5842,14 +5842,14 @@ fn test_force_realize_step_inert_above_threshold() {
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
     engine.deposit(lp, 50_000).unwrap();
 
-    // Create user with position
+    // Create user with position (must be >= min_liquidation_abs to avoid dust-closure)
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 10_000).unwrap();
-    engine.accounts[user as usize].position_size = I128::new(10_000);
+    engine.deposit(user, 100_000).unwrap();
+    engine.accounts[user as usize].position_size = I128::new(200_000);
     engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.accounts[lp as usize].position_size = I128::new(-10_000);
+    engine.accounts[lp as usize].position_size = I128::new(-200_000);
     engine.accounts[lp as usize].entry_price = 1_000_000;
-    engine.total_open_interest = U128::new(20_000);
+    engine.total_open_interest = U128::new(400_000);
 
     // Set insurance ABOVE threshold (force-realize NOT active)
     engine.insurance_fund.balance = U128::new(1001);
@@ -5873,6 +5873,57 @@ fn test_force_realize_step_inert_above_threshold() {
     assert_eq!(
         engine.accounts[user as usize].position_size, pos_before,
         "Position should be unchanged"
+    );
+}
+
+/// Test: Dust positions (below min_liquidation_abs) are force-closed during crank
+/// even when insurance is above threshold (not in force-realize mode).
+#[test]
+fn test_crank_force_closes_dust_positions() {
+    let mut params = default_params();
+    params.risk_reduction_threshold = U128::new(1000);
+    params.min_liquidation_abs = U128::new(100_000); // 100k minimum
+    let mut engine = Box::new(RiskEngine::new(params));
+    engine.vault = U128::new(100_000);
+
+    // Create counterparty LP
+    let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    engine.deposit(lp, 50_000).unwrap();
+
+    // Create user with DUST position (below min_liquidation_abs)
+    let user = engine.add_user(0).unwrap();
+    engine.deposit(user, 10_000).unwrap();
+    engine.accounts[user as usize].position_size = I128::new(50_000); // Below 100k threshold
+    engine.accounts[user as usize].entry_price = 1_000_000;
+    engine.accounts[lp as usize].position_size = I128::new(-50_000);
+    engine.accounts[lp as usize].entry_price = 1_000_000;
+    engine.total_open_interest = U128::new(100_000);
+
+    // Set insurance ABOVE threshold (force-realize NOT active)
+    engine.insurance_fund.balance = U128::new(2000);
+
+    assert!(
+        !engine.accounts[user as usize].position_size.is_zero(),
+        "User should have position before crank"
+    );
+
+    // Run crank
+    let outcome = engine.keeper_crank(u16::MAX, 1, 1_000_000, 0, false).unwrap();
+
+    // Force-realize mode should NOT be needed (insurance above threshold)
+    assert!(
+        !outcome.force_realize_needed,
+        "Force-realize should not be needed"
+    );
+
+    // But the dust position should still be closed
+    assert!(
+        engine.accounts[user as usize].position_size.is_zero(),
+        "Dust position should be force-closed"
+    );
+    assert!(
+        engine.accounts[lp as usize].position_size.is_zero(),
+        "LP dust position should also be force-closed"
     );
 }
 
