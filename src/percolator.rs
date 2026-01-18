@@ -462,9 +462,8 @@ pub enum AccountKind {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Account {
-    pub kind: AccountKind,
-
     /// Unique account ID (monotonically increasing, never recycled)
+    /// Note: Field order matches on-chain slab layout (account_id at offset 0)
     pub account_id: u64,
 
     // ========================================
@@ -474,11 +473,16 @@ pub struct Account {
     /// NEVER reduced by ADL/socialization (Invariant I1)
     pub capital: U128,
 
+    /// Account kind (User or LP)
+    /// Note: Field is at offset 24 in on-chain layout, after capital
+    pub kind: AccountKind,
+
     /// Realized PNL from trading (can be positive or negative)
     pub pnl: I128,
 
     /// PNL reserved for pending withdrawals
-    pub reserved_pnl: U128,
+    /// Note: u64 to match on-chain slab layout (8 bytes, not 16)
+    pub reserved_pnl: u64,
 
     // ========================================
     // Warmup (embedded, no separate struct)
@@ -524,6 +528,9 @@ pub struct Account {
 
     /// Last slot when maintenance fees were settled for this account
     pub last_fee_slot: u64,
+
+    /// Padding to match on-chain Account size (248 bytes)
+    pub _padding: [u8; 8],
 }
 
 impl Account {
@@ -550,11 +557,11 @@ impl Account {
 /// Helper to create empty account
 fn empty_account() -> Account {
     Account {
-        kind: AccountKind::User,
         account_id: 0,
         capital: U128::ZERO,
+        kind: AccountKind::User,
         pnl: I128::ZERO,
-        reserved_pnl: U128::ZERO,
+        reserved_pnl: 0,
         warmup_started_at_slot: 0,
         warmup_slope_per_step: U128::ZERO,
         position_size: I128::ZERO,
@@ -565,6 +572,7 @@ fn empty_account() -> Account {
         owner: [0; 32],
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
+        _padding: [0; 8],
     }
 }
 
@@ -835,6 +843,13 @@ pub struct RiskEngine {
 
     /// Freelist head (u16::MAX = none)
     pub free_head: u16,
+
+    /// Padding to align accounts with on-chain slab layout.
+    /// The original Account struct had `kind` at offset 0 and `account_id` at offset 8.
+    /// After reordering Account fields (account_id first), we need this padding
+    /// to maintain backward compatibility with existing on-chain data.
+    /// On-chain accounts are at engine offset 95256, not 95248.
+    pub _padding_accounts: [u8; 8],
 
     /// Freelist next pointers
     pub next_free: [u16; MAX_ACCOUNTS],
@@ -1121,6 +1136,7 @@ impl RiskEngine {
             num_used_accounts: 0,
             next_account_id: 0,
             free_head: 0,
+            _padding_accounts: [0; 8],
             next_free: [0; MAX_ACCOUNTS],
             accounts: [empty_account(); MAX_ACCOUNTS],
         };
@@ -1313,7 +1329,7 @@ impl RiskEngine {
             account_id,
             capital: U128::new(excess), // Bug #4 fix: excess goes to user capital
             pnl: I128::ZERO,
-            reserved_pnl: U128::ZERO,
+            reserved_pnl: 0,
             warmup_started_at_slot: self.current_slot,
             warmup_slope_per_step: U128::ZERO,
             position_size: I128::ZERO,
@@ -1324,6 +1340,7 @@ impl RiskEngine {
             owner: [0; 32],
             fee_credits: I128::ZERO,
             last_fee_slot: self.current_slot,
+            _padding: [0; 8],
         };
 
         Ok(idx)
@@ -1368,7 +1385,7 @@ impl RiskEngine {
             account_id,
             capital: U128::new(excess), // Bug #4 fix: excess goes to LP capital
             pnl: I128::ZERO,
-            reserved_pnl: U128::ZERO,
+            reserved_pnl: 0,
             warmup_started_at_slot: self.current_slot,
             warmup_slope_per_step: U128::ZERO,
             position_size: I128::ZERO,
@@ -1379,6 +1396,7 @@ impl RiskEngine {
             owner: [0; 32],
             fee_credits: I128::ZERO,
             last_fee_slot: self.current_slot,
+            _padding: [0; 8],
         };
 
         Ok(idx)
@@ -1663,6 +1681,12 @@ impl RiskEngine {
 
             let account = &self.accounts[idx];
 
+            // NEVER garbage collect LP accounts - they are essential for market operation
+            // LPs are identified by having a non-zero matcher_program
+            if account.matcher_program != [0u8; 32] {
+                continue;
+            }
+
             // Dust predicate: must have zero position, capital, reserved, and non-positive pnl
             if !account.position_size.is_zero() {
                 continue;
@@ -1670,7 +1694,7 @@ impl RiskEngine {
             if !account.capital.is_zero() {
                 continue;
             }
-            if !account.reserved_pnl.is_zero() {
+            if account.reserved_pnl != 0 {
                 continue;
             }
             if account.pnl.is_positive() {
@@ -3100,7 +3124,7 @@ impl RiskEngine {
         let positive_pnl = clamp_pos_i128(account.pnl.get());
 
         // Available = positive PNL - reserved
-        let available_pnl = sub_u128(positive_pnl, account.reserved_pnl.get());
+        let available_pnl = sub_u128(positive_pnl, account.reserved_pnl as u128);
 
         // Apply warmup pause - when paused, warmup cannot progress beyond pause_slot
         let effective_slot = if self.warmup_paused {
@@ -3358,8 +3382,12 @@ impl RiskEngine {
     // Deposits and Withdrawals
     // ========================================
 
-    /// Deposit funds to account
-    pub fn deposit(&mut self, idx: u16, amount: u128) -> Result<()> {
+    /// Deposit funds to account.
+    ///
+    /// Settles any accrued maintenance fees from the deposit first,
+    /// with the remainder added to capital. This ensures fee conservation
+    /// (fees are never forgiven) and prevents stuck accounts.
+    pub fn deposit(&mut self, idx: u16, amount: u128, now_slot: u64) -> Result<()> {
         // Deposits reduce risk (allowed in risk mode)
         self.enforce_op(OpClass::RiskReduce)?;
 
@@ -3367,8 +3395,38 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
-        self.accounts[idx as usize].capital = U128::new(add_u128(self.accounts[idx as usize].capital.get(), amount));
+        let account = &mut self.accounts[idx as usize];
+        let mut deposit_remaining = amount;
+
+        // Calculate and settle accrued fees
+        let dt = now_slot.saturating_sub(account.last_fee_slot);
+        if dt > 0 {
+            let due = self.params.maintenance_fee_per_slot.get().saturating_mul(dt as u128);
+            account.last_fee_slot = now_slot;
+            account.fee_credits = account.fee_credits.saturating_sub(due as i128);
+        }
+
+        // Pay any owed fees from deposit first
+        if account.fee_credits.is_negative() {
+            let owed = neg_i128_to_u128(account.fee_credits.get());
+            let pay = core::cmp::min(owed, deposit_remaining);
+
+            deposit_remaining -= pay;
+            self.insurance_fund.balance = self.insurance_fund.balance + pay;
+            self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
+
+            // Credit back what was paid
+            account.fee_credits = account.fee_credits.saturating_add(pay as i128);
+        }
+
+        // Vault gets full deposit (tokens received)
         self.vault = U128::new(add_u128(self.vault.get(), amount));
+
+        // Capital gets remainder after fees
+        self.accounts[idx as usize].capital = U128::new(add_u128(
+            self.accounts[idx as usize].capital.get(),
+            deposit_remaining,
+        ));
 
         // Settle warmup after deposit (allows losses to be paid promptly if underwater)
         self.settle_warmup_to_capital(idx)?;
@@ -3912,7 +3970,7 @@ impl RiskEngine {
             return 0;
         }
         let positive_pnl = account.pnl.get() as u128;
-        let available_pnl = positive_pnl.saturating_sub(account.reserved_pnl.get());
+        let available_pnl = positive_pnl.saturating_sub(account.reserved_pnl as u128);
         let elapsed_slots = effective_slot.saturating_sub(account.warmup_started_at_slot);
         let warmed_up_cap = mul_u128(account.warmup_slope_per_step.get(), elapsed_slots as u128);
         core::cmp::min(available_pnl, warmed_up_cap)
@@ -3932,7 +3990,7 @@ impl RiskEngine {
             return 0;
         }
         let positive_pnl = account.pnl.get() as u128;
-        let reserved = account.reserved_pnl.get();
+        let reserved = account.reserved_pnl as u128;
         let withdrawable = self.compute_withdrawable_pnl_at(account, effective_slot);
         positive_pnl
             .saturating_sub(reserved)
@@ -4134,7 +4192,7 @@ impl RiskEngine {
         if pnl > 0 && cap > 0 {
             self.require_no_pending_socialization()?;
             let positive_pnl = pnl as u128;
-            let reserved = self.accounts[idx as usize].reserved_pnl.get();
+            let reserved = self.accounts[idx as usize].reserved_pnl as u128;
             let avail = positive_pnl.saturating_sub(reserved);
 
             if avail > 0 {
