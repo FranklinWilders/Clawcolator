@@ -76,8 +76,8 @@ fn test_e2e_complete_user_journey() {
     let bob = engine.add_user(10_000).unwrap();
 
     // Users deposit principal
-    engine.deposit(alice, 10_000).unwrap();
-    engine.deposit(bob, 15_000).unwrap();
+    engine.deposit(alice, 10_000, 0, 0).unwrap();
+    engine.deposit(bob, 15_000, 0, 0).unwrap();
     engine.vault = U128::new(125_000); // 100k LP + 10k Alice + 15k Bob
 
     // === Phase 1: Trading ===
@@ -242,7 +242,7 @@ fn test_e2e_multi_user_with_adl() {
     let mut users = Vec::new();
     for _ in 0..5 {
         let user = engine.add_user(10_000).unwrap();
-        engine.deposit(user, 10_000).unwrap();
+        engine.deposit(user, 10_000, 0, 0).unwrap();
         users.push(user);
     }
     engine.vault = U128::new(250_000);
@@ -323,7 +323,7 @@ fn test_e2e_warmup_rate_limiting_stress() {
     let mut users = Vec::new();
     for _ in 0..10 {
         let user = engine.add_user(10_000).unwrap();
-        engine.deposit(user, 5_000).unwrap();
+        engine.deposit(user, 5_000, 0, 0).unwrap();
         users.push(user);
     }
     engine.vault = U128::new(550_000);
@@ -420,8 +420,8 @@ fn test_e2e_funding_complete_cycle() {
     let alice = engine.add_user(10_000).unwrap();
     let bob = engine.add_user(10_000).unwrap();
 
-    engine.deposit(alice, 20_000).unwrap();
-    engine.deposit(bob, 20_000).unwrap();
+    engine.deposit(alice, 20_000, 0, 0).unwrap();
+    engine.deposit(bob, 20_000, 0, 0).unwrap();
     engine.vault = U128::new(140_000);
 
     // Alice goes long, Bob goes short
@@ -513,11 +513,11 @@ fn test_e2e_oracle_attack_protection() {
 
     // Honest user
     let honest_user = engine.add_user(10_000).unwrap();
-    engine.deposit(honest_user, 20_000).unwrap();
+    engine.deposit(honest_user, 20_000, 0, 0).unwrap();
 
     // Attacker
     let attacker = engine.add_user(10_000).unwrap();
-    engine.deposit(attacker, 10_000).unwrap();
+    engine.deposit(attacker, 10_000, 0, 0).unwrap();
     engine.vault = U128::new(230_000);
 
     // === Phase 1: Normal Trading ===

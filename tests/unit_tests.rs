@@ -123,7 +123,7 @@ fn test_deposit_and_withdraw() {
 
     // Deposit
     let v0 = vault_snapshot(&engine);
-    engine.deposit(user_idx, 1000).unwrap();
+    engine.deposit(user_idx, 1000, 0).unwrap();
     assert_eq!(engine.accounts[user_idx as usize].capital.get(), 1000);
     assert_vault_delta(&engine, v0, 1000);
 
@@ -147,11 +147,54 @@ fn test_withdraw_insufficient_balance() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
     let user_idx = engine.add_user(0).unwrap();
 
-    engine.deposit(user_idx, 1000).unwrap();
+    engine.deposit(user_idx, 1000, 0).unwrap();
 
     // Try to withdraw more than deposited
     let result = engine.withdraw(user_idx, 1500, 0, 1_000_000);
     assert_eq!(result, Err(RiskError::InsufficientBalance));
+}
+
+#[test]
+fn test_deposit_settles_accrued_maintenance_fees() {
+    // Setup engine with non-zero maintenance fee
+    let mut params = default_params();
+    params.maintenance_fee_per_slot = U128::new(10); // 10 units per slot
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+
+    // Initial deposit at slot 0
+    engine.deposit(user_idx, 1000, 0).unwrap();
+    assert_eq!(engine.accounts[user_idx as usize].capital.get(), 1000);
+    assert_eq!(engine.accounts[user_idx as usize].last_fee_slot, 0);
+
+    // Deposit at slot 100 - should charge 100 * 10 = 1000 in fees
+    // But we're depositing 500, so:
+    // - 500 goes to pay fees (fee_credits goes from -1000 to -500)
+    // - 0 goes to capital
+    let insurance_before = engine.insurance_fund.balance;
+    engine.deposit(user_idx, 500, 100).unwrap();
+
+    // Account's last_fee_slot should be updated
+    assert_eq!(engine.accounts[user_idx as usize].last_fee_slot, 100);
+
+    // Capital should remain 1000 (deposit was consumed by fees)
+    assert_eq!(engine.accounts[user_idx as usize].capital.get(), 1000);
+
+    // Insurance fund should have received 500 in fee revenue
+    assert_eq!((engine.insurance_fund.balance - insurance_before).get(), 500);
+
+    // fee_credits should still be negative (-500)
+    assert_eq!(engine.accounts[user_idx as usize].fee_credits.get(), -500);
+
+    // Now deposit 1000 more at slot 100 (no additional fees)
+    engine.deposit(user_idx, 1000, 100).unwrap();
+
+    // 500 pays remaining fees, 500 goes to capital
+    assert_eq!(engine.accounts[user_idx as usize].capital.get(), 1500);
+    assert_eq!(engine.accounts[user_idx as usize].fee_credits.get(), 0);
+
+    assert_conserved(&engine);
 }
 
 #[test]
@@ -160,7 +203,7 @@ fn test_withdraw_principal_with_negative_pnl_should_fail() {
     let user_idx = engine.add_user(0).unwrap();
 
     // User deposits 1000
-    engine.deposit(user_idx, 1000).unwrap();
+    engine.deposit(user_idx, 1000, 0).unwrap();
 
     // User has a position and negative PNL of -800
     engine.accounts[user_idx as usize].position_size = I128::new(10_000);
@@ -246,7 +289,7 @@ fn test_withdraw_pnl_not_warmed_up() {
     let user_idx = engine.add_user(0).unwrap();
     let counterparty = engine.add_user(0).unwrap();
 
-    engine.deposit(user_idx, 1000).unwrap();
+    engine.deposit(user_idx, 1000, 0).unwrap();
     // Zero-sum PNL: user gains, counterparty loses (no vault funding needed)
     assert_eq!(engine.accounts[user_idx as usize].pnl.get(), 0);
     assert_eq!(engine.accounts[counterparty as usize].pnl.get(), 0);
@@ -270,7 +313,7 @@ fn test_withdraw_with_warmed_up_pnl() {
     // Budget = warmed_neg_total + insurance_spendable_raw() = 0 + 500 = 500
     set_insurance(&mut engine, 500);
 
-    engine.deposit(user_idx, 1000).unwrap();
+    engine.deposit(user_idx, 1000, 0).unwrap();
     // Zero-sum PnL: user gains, counterparty loses (no vault funding needed)
     assert_eq!(engine.accounts[user_idx as usize].pnl.get(), 0);
     assert_eq!(engine.accounts[counterparty as usize].pnl.get(), 0);
@@ -299,11 +342,11 @@ fn test_conservation_simple() {
     assert!(engine.check_conservation());
 
     // Deposit to user1
-    engine.deposit(user1, 1000).unwrap();
+    engine.deposit(user1, 1000, 0).unwrap();
     assert!(engine.check_conservation());
 
     // Deposit to user2
-    engine.deposit(user2, 2000).unwrap();
+    engine.deposit(user2, 2000, 0).unwrap();
     assert!(engine.check_conservation());
 
     // PNL is zero-sum: user1 gains 500, user2 loses 500
@@ -453,7 +496,7 @@ fn test_trading_opens_position() {
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
     // Setup user with capital
-    engine.deposit(user_idx, 10_000).unwrap();
+    engine.deposit(user_idx, 10_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault to preserve conservation.
     engine.accounts[lp_idx as usize].capital = U128::new(100_000);
     engine.vault += 100_000;
@@ -484,7 +527,7 @@ fn test_trading_realizes_pnl() {
     let user_idx = engine.add_user(0).unwrap();
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(user_idx, 10_000).unwrap();
+    engine.deposit(user_idx, 10_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault (not override) to preserve account fees.
     engine.accounts[lp_idx as usize].capital = U128::new(100_000);
     engine.vault += 100_000;
@@ -512,8 +555,8 @@ fn test_user_isolation() {
     let user1 = engine.add_user(0).unwrap();
     let user2 = engine.add_user(0).unwrap();
 
-    engine.deposit(user1, 1000).unwrap();
-    engine.deposit(user2, 2000).unwrap();
+    engine.deposit(user1, 1000, 0).unwrap();
+    engine.deposit(user2, 2000, 0).unwrap();
 
     let user2_principal_before = engine.accounts[user2 as usize].capital;
     let user2_pnl_before = engine.accounts[user2 as usize].pnl;
@@ -624,7 +667,7 @@ fn test_fee_accumulation() {
     let user_idx = engine.add_user(0).unwrap();
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(user_idx, 100_000).unwrap();
+    engine.deposit(user_idx, 100_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault (not override) to preserve account fees.
     engine.accounts[lp_idx as usize].capital = U128::new(1_000_000);
     engine.vault += 1_000_000;
@@ -778,7 +821,7 @@ fn test_funding_positive_rate_longs_pay_shorts() {
     let user_idx = engine.add_user(0).unwrap();
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(user_idx, 100_000).unwrap();
+    engine.deposit(user_idx, 100_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault (not override) to preserve account fees.
     engine.accounts[lp_idx as usize].capital = U128::new(1_000_000);
     engine.vault += 1_000_000;
@@ -844,7 +887,7 @@ fn test_funding_negative_rate_shorts_pay_longs() {
     let user_idx = engine.add_user(0).unwrap();
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(user_idx, 100_000).unwrap();
+    engine.deposit(user_idx, 100_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault (not override) to preserve account fees.
     engine.accounts[lp_idx as usize].capital = U128::new(1_000_000);
     engine.vault += 1_000_000;
@@ -897,7 +940,7 @@ fn test_funding_idempotence() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
     let user_idx = engine.add_user(10000).unwrap();
 
-    engine.deposit(user_idx, 100_000).unwrap();
+    engine.deposit(user_idx, 100_000, 0).unwrap();
     engine.accounts[user_idx as usize].position_size = I128::new(1_000_000);
 
     // Accrue funding
@@ -924,7 +967,7 @@ fn test_funding_partial_close() {
     let user_idx = engine.add_user(0).unwrap();
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(user_idx, 15_000_000).unwrap();
+    engine.deposit(user_idx, 15_000_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault (not override) to preserve account fees.
     engine.accounts[lp_idx as usize].capital = U128::new(50_000_000);
     engine.vault += 50_000_000;
@@ -968,7 +1011,7 @@ fn test_funding_position_flip() {
     let user_idx = engine.add_user(0).unwrap();
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(user_idx, 10_000_000).unwrap();
+    engine.deposit(user_idx, 10_000_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault (not override) to preserve account fees.
     engine.accounts[lp_idx as usize].capital = U128::new(20_000_000);
     engine.vault += 20_000_000;
@@ -1016,7 +1059,7 @@ fn test_funding_zero_position() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
     let user_idx = engine.add_user(10000).unwrap();
 
-    engine.deposit(user_idx, 100_000).unwrap();
+    engine.deposit(user_idx, 100_000, 0).unwrap();
 
     // No position
     assert_eq!(engine.accounts[user_idx as usize].position_size.get(), 0);
@@ -1040,7 +1083,7 @@ fn test_funding_does_not_touch_principal() {
     let user_idx = engine.add_user(0).unwrap();
 
     let initial_principal = 100_000;
-    engine.deposit(user_idx, initial_principal).unwrap();
+    engine.deposit(user_idx, initial_principal, 0).unwrap();
 
     engine.accounts[user_idx as usize].position_size = I128::new(1_000_000);
 
@@ -1066,8 +1109,8 @@ fn test_adl_protects_principal_during_warmup() {
     let victim = engine.add_user(10000).unwrap();
 
     // Both deposit principal
-    engine.deposit(attacker, 10_000).unwrap();
-    engine.deposit(victim, 10_000).unwrap();
+    engine.deposit(attacker, 10_000, 0).unwrap();
+    engine.deposit(victim, 10_000, 0).unwrap();
 
     // Add insurance to provide warmup budget for converting positive PnL to capital
     // Budget = warmed_neg_total + insurance_spendable_raw() = 0 + 10000 = 10000
@@ -1235,7 +1278,7 @@ fn test_warmup_rate_limit_single_user() {
     assert_eq!(expected_max_rate, 100);
 
     let user = engine.add_user(100).unwrap();
-    engine.deposit(user, 1_000).unwrap();
+    engine.deposit(user, 1_000, 0).unwrap();
 
     // Give user 20,000 PNL (would need slope of 200 without limit)
     assert_eq!(engine.accounts[user as usize].pnl.get(), 0);
@@ -1269,8 +1312,8 @@ fn test_warmup_rate_limit_multiple_users() {
     let user1 = engine.add_user(100).unwrap();
     let user2 = engine.add_user(100).unwrap();
 
-    engine.deposit(user1, 1_000).unwrap();
-    engine.deposit(user2, 1_000).unwrap();
+    engine.deposit(user1, 1_000, 0).unwrap();
+    engine.deposit(user2, 1_000, 0).unwrap();
 
     // User1 gets 6,000 PNL (would want slope of 60)
     assert_eq!(engine.accounts[user1 as usize].pnl.get(), 0);
@@ -1302,8 +1345,8 @@ fn test_warmup_rate_released_on_pnl_decrease() {
     let user1 = engine.add_user(100).unwrap();
     let user2 = engine.add_user(100).unwrap();
 
-    engine.deposit(user1, 1_000).unwrap();
-    engine.deposit(user2, 1_000).unwrap();
+    engine.deposit(user1, 1_000, 0).unwrap();
+    engine.deposit(user2, 1_000, 0).unwrap();
 
     // User1 uses all capacity
     assert_eq!(engine.accounts[user1 as usize].pnl.get(), 0);
@@ -1342,7 +1385,7 @@ fn test_warmup_rate_scales_with_insurance_fund() {
     set_insurance(&mut engine, 1_000);
 
     let user = engine.add_user(100).unwrap();
-    engine.deposit(user, 1_000).unwrap();
+    engine.deposit(user, 1_000, 0).unwrap();
 
     assert_eq!(engine.accounts[user as usize].pnl.get(), 0);
     engine.accounts[user as usize].pnl = I128::new(10_000);
@@ -1376,7 +1419,7 @@ fn test_warmup_rate_limit_invariant_maintained() {
     // Add multiple users with varying PNL
     for i in 0..10 {
         let user = engine.add_user(100).unwrap();
-        engine.deposit(user, 1_000).unwrap();
+        engine.deposit(user, 1_000, 0).unwrap();
         engine.accounts[user as usize].pnl = (i as i128 + 1) * 1_000;
         engine.update_warmup_slope(user).unwrap();
 
@@ -1403,8 +1446,8 @@ fn test_risk_reduction_only_mode_triggered_by_loss() {
     let user1 = engine.add_user(100).unwrap();
     let user2 = engine.add_user(100).unwrap();
 
-    engine.deposit(user1, 10_000).unwrap();
-    engine.deposit(user2, 10_000).unwrap();
+    engine.deposit(user1, 10_000, 0).unwrap();
+    engine.deposit(user2, 10_000, 0).unwrap();
 
     // Set insurance fund balance AFTER adding users (to avoid fee confusion)
     set_insurance(&mut engine, 5_000);
@@ -1429,8 +1472,8 @@ fn test_proportional_haircut_on_withdrawal() {
     let user1 = engine.add_user(100).unwrap();
     let user2 = engine.add_user(100).unwrap();
 
-    engine.deposit(user1, 10_000).unwrap();
-    engine.deposit(user2, 5_000).unwrap();
+    engine.deposit(user1, 10_000, 0).unwrap();
+    engine.deposit(user2, 5_000, 0).unwrap();
 
     // Set insurance fund balance AFTER adding users (to avoid fee confusion)
     set_insurance(&mut engine, 1_000);
@@ -1478,7 +1521,7 @@ fn test_closing_positions_allowed_in_withdrawal_mode() {
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 100).unwrap();
     let user = engine.add_user(100).unwrap();
 
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault (not override) to preserve account fees.
     engine.accounts[lp as usize].capital = U128::new(50_000);
     engine.vault += 50_000;
@@ -1512,7 +1555,7 @@ fn test_opening_positions_blocked_in_withdrawal_mode() {
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 100).unwrap();
     let user = engine.add_user(100).unwrap();
 
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
     engine.accounts[lp as usize].capital = U128::new(50_000);
 
     // Set insurance fund balance AFTER adding users (to avoid fee confusion)
@@ -1535,7 +1578,7 @@ fn test_warmup_freezes_in_risk_mode() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
     let user = engine.add_user(100).unwrap();
 
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
 
     // Setup: user has pnl=+1000, slope=10, started_at_slot=0
     assert_eq!(engine.accounts[user as usize].pnl.get(), 0);
@@ -1569,7 +1612,7 @@ fn test_risk_mode_deposit_withdrawals_work() {
     let user = engine.add_user(0).unwrap();
 
     // User deposit 1000
-    engine.deposit(user, 1000).unwrap();
+    engine.deposit(user, 1000, 0).unwrap();
 
     // Enter risk mode
     engine.enter_risk_reduction_only_mode();
@@ -1655,7 +1698,7 @@ fn test_risk_increasing_trade_fails_in_risk_mode() {
     let user = engine.add_user(100).unwrap();
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 100).unwrap();
 
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault (not override) to preserve account fees.
     engine.accounts[lp as usize].capital = U128::new(50_000);
     engine.vault += 50_000;
@@ -1683,7 +1726,7 @@ fn test_reduce_only_trade_succeeds_in_risk_mode() {
     let user = engine.add_user(100).unwrap();
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 100).unwrap();
 
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
     // WHITEBOX: Set LP capital directly. Add to vault (not override) to preserve account fees.
     engine.accounts[lp as usize].capital = U128::new(50_000);
     engine.vault += 50_000;
@@ -1713,7 +1756,7 @@ fn test_exiting_mode_unfreezes_warmup() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
     let user = engine.add_user(100).unwrap();
 
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
 
     // Create deficit, enter risk mode
     engine.loss_accum = U128::new(1000);
@@ -1736,7 +1779,7 @@ fn test_top_up_insurance_fund_reduces_loss() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
 
     let user = engine.add_user(100).unwrap();
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
 
     // Set insurance fund balance AFTER adding users (to avoid fee confusion)
     set_insurance(&mut engine, 1_000);
@@ -1769,7 +1812,7 @@ fn test_deposits_allowed_in_withdrawal_mode() {
     let user1 = engine.add_user(100).unwrap();
     let user2 = engine.add_user(100).unwrap();
 
-    engine.deposit(user1, 10_000).unwrap();
+    engine.deposit(user1, 10_000, 0).unwrap();
 
     // Set insurance fund balance AFTER adding users (to avoid fee confusion)
     set_insurance(&mut engine, 1_000);
@@ -1780,7 +1823,7 @@ fn test_deposits_allowed_in_withdrawal_mode() {
     assert!(engine.risk_reduction_only);
 
     // User2 deposits - should be allowed
-    let result = engine.deposit(user2, 5_000);
+    let result = engine.deposit(user2, 5_000, 0);
     assert!(result.is_ok(), "Deposits should be allowed in withdrawal mode");
 
     // Total principal now 15k, loss still 1k
@@ -1809,9 +1852,9 @@ fn test_fair_unwinding_scenario() {
     let bob = engine.add_user(100).unwrap();
     let charlie = engine.add_user(100).unwrap();
 
-    engine.deposit(alice, 10_000).unwrap();
-    engine.deposit(bob, 20_000).unwrap();
-    engine.deposit(charlie, 10_000).unwrap();
+    engine.deposit(alice, 10_000, 0).unwrap();
+    engine.deposit(bob, 20_000, 0).unwrap();
+    engine.deposit(charlie, 10_000, 0).unwrap();
 
     // Set insurance fund balance AFTER adding users (to avoid fee confusion)
     set_insurance(&mut engine, 5_000);
@@ -1878,12 +1921,12 @@ fn test_lp_withdraw() {
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
     // LP deposits capital
-    engine.deposit(lp_idx, 10_000).unwrap();
+    engine.deposit(lp_idx, 10_000, 0).unwrap();
 
     // LP earns PNL from counterparty (need zero-sum setup)
     // Create a user to be the counterparty
     let user_idx = engine.add_user(0).unwrap();
-    engine.deposit(user_idx, 5_000).unwrap();
+    engine.deposit(user_idx, 5_000, 0).unwrap();
 
     // Add insurance to provide warmup budget for converting LP's positive PnL to capital
     // Budget = warmed_neg_total + insurance_spendable_raw() = 0 + 5000 = 5000
@@ -1934,8 +1977,8 @@ fn test_lp_withdraw_with_haircut() {
     let user_idx = engine.add_user(0).unwrap();
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(user_idx, 10_000).unwrap();
-    engine.deposit(lp_idx, 10_000).unwrap();
+    engine.deposit(user_idx, 10_000, 0).unwrap();
+    engine.deposit(lp_idx, 10_000, 0).unwrap();
 
     // Simulate crisis - set loss_accum
     engine.loss_accum = U128::new(5_000); // 25% loss
@@ -2046,7 +2089,7 @@ fn test_lp_capital_never_reduced_by_adl() {
 
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(lp_idx, 10_000).unwrap();
+    engine.deposit(lp_idx, 10_000, 0).unwrap();
     assert_eq!(engine.accounts[lp_idx as usize].pnl.get(), 0);
     engine.accounts[lp_idx as usize].pnl = I128::new(5_000);
 
@@ -2078,7 +2121,7 @@ fn test_risk_reduction_threshold() {
     let mut engine = Box::new(RiskEngine::new(params));
 
     let user = engine.add_user(100).unwrap();
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
 
     // Setup: insurance fund has 10k, which is above threshold
     set_insurance(&mut engine, 10_000);
@@ -2136,9 +2179,9 @@ fn test_panic_settle_closes_all_positions() {
     let user2 = engine.add_user(0).unwrap();
 
     // Fund accounts
-    engine.deposit(lp_idx, 100_000).unwrap();
-    engine.deposit(user1, 10_000).unwrap();
-    engine.deposit(user2, 10_000).unwrap();
+    engine.deposit(lp_idx, 100_000, 0).unwrap();
+    engine.deposit(user1, 10_000, 0).unwrap();
+    engine.deposit(user2, 10_000, 0).unwrap();
 
     // Set positions: user1 long +10, user2 short -7, lp takes opposite (-3)
     engine.accounts[user1 as usize].position_size = I128::new(10_000_000); // +10 contracts
@@ -2173,7 +2216,7 @@ fn test_panic_settle_clamps_negative_pnl() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
 
     let user_idx = engine.add_user(0).unwrap();
-    engine.deposit(user_idx, 10_000).unwrap();
+    engine.deposit(user_idx, 10_000, 0).unwrap();
 
     // User is long at $1, oracle will be $0.50 => big loss
     engine.accounts[user_idx as usize].position_size = I128::new(100_000_000); // Large long
@@ -2208,11 +2251,11 @@ fn test_panic_settle_adl_waterfall() {
 
     // Account A with unwrapped PNL (warmup_slope = 0, so nothing is withdrawable)
     let winner = engine.add_user(0).unwrap();
-    engine.deposit(winner, 10_000).unwrap();
+    engine.deposit(winner, 10_000, 0).unwrap();
 
     // Loser account that will have a position
     let loser = engine.add_user(0).unwrap();
-    engine.deposit(loser, 10_000).unwrap();
+    engine.deposit(loser, 10_000, 0).unwrap();
 
     // Set up zero-sum positions at same entry price
     // Loser has a long position
@@ -2260,7 +2303,7 @@ fn test_panic_settle_freezes_warmup() {
 
     let user_idx = engine.add_user(0).unwrap();
     let counterparty = engine.add_user(0).unwrap();
-    engine.deposit(user_idx, 10_000).unwrap();
+    engine.deposit(user_idx, 10_000, 0).unwrap();
 
     // Zero-sum PnL: user gains, counterparty loses (no vault funding needed)
     assert_eq!(engine.accounts[user_idx as usize].pnl.get(), 0);
@@ -2306,9 +2349,9 @@ fn test_panic_settle_conservation_holds() {
     let user1 = engine.add_user(0).unwrap();
     let user2 = engine.add_user(0).unwrap();
 
-    engine.deposit(lp_idx, 50_000).unwrap();
-    engine.deposit(user1, 10_000).unwrap();
-    engine.deposit(user2, 10_000).unwrap();
+    engine.deposit(lp_idx, 50_000, 0).unwrap();
+    engine.deposit(user1, 10_000, 0).unwrap();
+    engine.deposit(user2, 10_000, 0).unwrap();
 
     // Set up positions at same entry price (net position = 0)
     // This ensures positions are zero-sum
@@ -3161,8 +3204,8 @@ fn test_no_insurance_minting_on_rounding() {
     let user_idx = engine.add_user(0).unwrap();
 
     // Setup accounts with positions that will cause rounding
-    engine.deposit(lp_idx, 10_000).unwrap();
-    engine.deposit(user_idx, 10_000).unwrap();
+    engine.deposit(lp_idx, 10_000, 0).unwrap();
+    engine.deposit(user_idx, 10_000, 0).unwrap();
 
     // Create opposing positions
     engine.accounts[lp_idx as usize].position_size = I128::new(-100);
@@ -3202,8 +3245,8 @@ fn test_reserved_correctly_recomputed() {
     set_insurance(&mut engine, 500);
     assert_conserved(&engine);
 
-    engine.deposit(lp_idx, 10_000).unwrap();
-    engine.deposit(user_idx, 1_000).unwrap();
+    engine.deposit(lp_idx, 10_000, 0).unwrap();
+    engine.deposit(user_idx, 1_000, 0).unwrap();
 
     // Zero-sum PnL: user gains, lp loses (no vault funding needed)
     assert_eq!(engine.accounts[user_idx as usize].pnl.get(), 0);
@@ -3328,7 +3371,7 @@ fn test_audit_a_settle_idempotent_when_paused() {
 
     // Setup: User has positive PnL with warmup slope
     set_insurance(&mut engine, 10_000); // Provide warmup budget
-    engine.deposit(user_idx, 1_000).unwrap();
+    engine.deposit(user_idx, 1_000, 0).unwrap();
     // Zero-sum PnL: user gains, counterparty loses (no vault funding needed)
     assert_eq!(engine.accounts[user_idx as usize].pnl.get(), 0);
     assert_eq!(engine.accounts[counterparty as usize].pnl.get(), 0);
@@ -3397,7 +3440,7 @@ fn test_audit_a_settle_idempotent_multiple_times_while_paused() {
 
     // Setup
     set_insurance(&mut engine, 10_000);
-    engine.deposit(user_idx, 1_000).unwrap();
+    engine.deposit(user_idx, 1_000, 0).unwrap();
     // Zero-sum PnL: user gains, counterparty loses (no vault funding needed)
     assert_eq!(engine.accounts[user_idx as usize].pnl.get(), 0);
     assert_eq!(engine.accounts[counterparty as usize].pnl.get(), 0);
@@ -3452,8 +3495,8 @@ fn test_audit_b_conservation_after_panic_settle_with_rounding() {
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
     // Setup opposing positions that will create rounding when settled
-    engine.deposit(user_idx, 50_000).unwrap();
-    engine.deposit(lp_idx, 50_000).unwrap();
+    engine.deposit(user_idx, 50_000, 0).unwrap();
+    engine.deposit(lp_idx, 50_000, 0).unwrap();
 
     // Create positions with values that will cause integer division rounding
     // Position size of 333 at price 1_000_003 creates rounding scenarios
@@ -3495,8 +3538,8 @@ fn test_audit_b_conservation_after_force_realize_with_rounding() {
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
     // Setup - do deposits first
-    engine.deposit(user_idx, 50_000).unwrap();
-    engine.deposit(lp_idx, 50_000).unwrap();
+    engine.deposit(user_idx, 50_000, 0).unwrap();
+    engine.deposit(lp_idx, 50_000, 0).unwrap();
 
     // Adjust insurance to be at threshold to trigger force_realize
     // After account creation and deposits:
@@ -3549,9 +3592,9 @@ fn test_audit_c_reserved_insurance_not_spent_in_adl() {
     assert_conserved(&engine);
 
     // Winner has positive PnL that will warm up
-    engine.deposit(winner_idx, 1_000).unwrap();
+    engine.deposit(winner_idx, 1_000, 0).unwrap();
     // Loser has no capital PnL to haircut (but provides zero-sum for winner's pnl)
-    engine.deposit(loser_idx, 1_000).unwrap();
+    engine.deposit(loser_idx, 1_000, 0).unwrap();
     // Zero-sum PnL: winner gains, loser loses (no vault funding needed)
     assert_eq!(engine.accounts[winner_idx as usize].pnl.get(), 0);
     assert_eq!(engine.accounts[loser_idx as usize].pnl.get(), 0);
@@ -3630,7 +3673,7 @@ fn test_audit_c_insurance_floor_plus_reserved_protected() {
     set_insurance(&mut engine, 500);
     assert_conserved(&engine);
 
-    engine.deposit(user_idx, 5_000).unwrap();
+    engine.deposit(user_idx, 5_000, 0).unwrap();
     // Zero-sum PnL: user gains, counterparty loses (no vault funding needed)
     assert_eq!(engine.accounts[user_idx as usize].pnl.get(), 0);
     assert_eq!(engine.accounts[counterparty as usize].pnl.get(), 0);
@@ -3675,7 +3718,7 @@ fn test_audit_conservation_slack_bounded() {
     for i in 0..50 {
         let user_idx = engine.add_user(0).unwrap();
         user_indices.push(user_idx);
-        engine.deposit(user_idx, 1000 + i as u128).unwrap();
+        engine.deposit(user_idx, 1000 + i as u128, 0).unwrap();
 
         // Create positions with rounding-prone values
         engine.accounts[user_idx as usize].position_size = I128::new((100 + i) as i128);
@@ -3684,7 +3727,7 @@ fn test_audit_conservation_slack_bounded() {
 
     // Create an LP to take the other side
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp_idx, 1_000_000).unwrap();
+    engine.deposit(lp_idx, 1_000_000, 0).unwrap();
 
     // Set LP position to net out user positions
     let total_user_pos: i128 = user_indices
@@ -3725,7 +3768,7 @@ fn test_audit_conservation_detects_excessive_slack() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
     let user_idx = engine.add_user(0).unwrap();
 
-    engine.deposit(user_idx, 10_000).unwrap();
+    engine.deposit(user_idx, 10_000, 0).unwrap();
 
     // Conservation should hold normally
     assert!(engine.check_conservation(), "Normal conservation");
@@ -3756,8 +3799,8 @@ fn test_audit_force_realize_prevents_warmup_repay() {
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
     // Setup loser with a position that will have negative PnL
-    engine.deposit(loser_idx, 10_000).unwrap();
-    engine.deposit(lp_idx, 100_000).unwrap();
+    engine.deposit(loser_idx, 10_000, 0).unwrap();
+    engine.deposit(lp_idx, 100_000, 0).unwrap();
 
     // Loser has a long position at high price (will lose when we settle at lower price)
     engine.accounts[loser_idx as usize].position_size = I128::new(1000);
@@ -3831,9 +3874,9 @@ fn test_audit_force_realize_updates_all_accounts_warmup() {
     let user2 = engine.add_user(0).unwrap();
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(user1, 10_000).unwrap();
-    engine.deposit(user2, 10_000).unwrap();
-    engine.deposit(lp_idx, 100_000).unwrap();
+    engine.deposit(user1, 10_000, 0).unwrap();
+    engine.deposit(user2, 10_000, 0).unwrap();
+    engine.deposit(lp_idx, 100_000, 0).unwrap();
 
     // Both users have positions
     engine.accounts[user1 as usize].position_size = I128::new(500);
@@ -3916,8 +3959,8 @@ fn api_sequence_conservation_smoke_test() {
     let user = engine.add_user(0).unwrap();
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
 
-    engine.deposit(user, 10_000).unwrap();
-    engine.deposit(lp, 50_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
+    engine.deposit(lp, 50_000, 0).unwrap();
 
     assert_conserved(&engine);
 
@@ -3959,13 +4002,13 @@ fn test_adl_exact_haircut_distribution() {
     let user3 = engine.add_user(0).unwrap();
 
     // Deposit capital
-    engine.deposit(user1, 10_000).unwrap();
-    engine.deposit(user2, 10_000).unwrap();
-    engine.deposit(user3, 10_000).unwrap();
+    engine.deposit(user1, 10_000, 0).unwrap();
+    engine.deposit(user2, 10_000, 0).unwrap();
+    engine.deposit(user3, 10_000, 0).unwrap();
 
     // Create counterparty for zero-sum pnl
     let loser = engine.add_user(4).unwrap();
-    engine.deposit(loser, 50_000).unwrap();
+    engine.deposit(loser, 50_000, 0).unwrap();
 
     // Set up positive PnL on each user (will be unwrapped since no warmup time)
     // Use values that will cause remainder: 100 + 100 + 100 = 300 total unwrapped
@@ -4013,7 +4056,7 @@ fn test_warmup_slope_nonzero() {
     let mut engine = Box::new(RiskEngine::new(params));
 
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
 
     // Set minimal positive PnL (1 unit, less than warmup_period_slots)
     engine.accounts[user as usize].pnl = I128::new(1);
@@ -4021,7 +4064,7 @@ fn test_warmup_slope_nonzero() {
     // Create counterparty for zero-sum
     // Zero-sum pattern: net_pnl = 0, so no vault funding needed
     let loser = engine.add_user(0).unwrap();
-    engine.deposit(loser, 10_000).unwrap();
+    engine.deposit(loser, 10_000, 0).unwrap();
     engine.accounts[loser as usize].pnl = I128::new(-1);
 
     assert_conserved(&engine);
@@ -4057,8 +4100,8 @@ fn test_warmup_reserve_release() {
     let winner = engine.add_user(0).unwrap();
     let loser = engine.add_user(0).unwrap();
 
-    engine.deposit(winner, 10_000).unwrap();
-    engine.deposit(loser, 10_000).unwrap();
+    engine.deposit(winner, 10_000, 0).unwrap();
+    engine.deposit(loser, 10_000, 0).unwrap();
 
     // Set up zero-sum PnL
     // Zero-sum pattern: net_pnl = 0, so no vault funding needed
@@ -4112,12 +4155,12 @@ fn test_unwrapped_definition() {
     let mut engine = Box::new(RiskEngine::new(params));
 
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
 
     // Create counterparty for zero-sum
     // Zero-sum pattern: net_pnl = 0, so no vault funding needed
     let loser = engine.add_user(0).unwrap();
-    engine.deposit(loser, 10_000).unwrap();
+    engine.deposit(loser, 10_000, 0).unwrap();
     engine.accounts[loser as usize].pnl = I128::new(-1000);
 
     // Set positive PnL and reserved
@@ -4196,7 +4239,7 @@ fn test_adl_largest_remainder_exactness() {
 
     // Create LP to take the opposite side of PnL (zero-sum)
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, 10_000).unwrap();
+    engine.deposit(lp, 10_000, 0).unwrap();
 
     // Create 3 accounts with uneven unwrapped PnL amounts
     let user1 = engine.add_user(0).unwrap();
@@ -4204,9 +4247,9 @@ fn test_adl_largest_remainder_exactness() {
     let user3 = engine.add_user(0).unwrap();
 
     // Deposit capital
-    engine.deposit(user1, 1000).unwrap();
-    engine.deposit(user2, 1000).unwrap();
-    engine.deposit(user3, 1000).unwrap();
+    engine.deposit(user1, 1000, 0).unwrap();
+    engine.deposit(user2, 1000, 0).unwrap();
+    engine.deposit(user3, 1000, 0).unwrap();
 
     // Assign uneven positive PnL (unwrapped since no warmup yet)
     // Total = 100 + 200 + 300 = 600
@@ -4256,14 +4299,14 @@ fn test_adl_tiebreak_lower_idx_wins() {
 
     // Create LP to take the opposite side of PnL (zero-sum)
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, 10_000).unwrap();
+    engine.deposit(lp, 10_000, 0).unwrap();
 
     // Create 2 accounts with identical unwrapped PnL
     let user1 = engine.add_user(0).unwrap();
     let user2 = engine.add_user(0).unwrap();
 
-    engine.deposit(user1, 1000).unwrap();
-    engine.deposit(user2, 1000).unwrap();
+    engine.deposit(user1, 1000, 0).unwrap();
+    engine.deposit(user2, 1000, 0).unwrap();
 
     // Same PnL = same remainder for any proportional calculation
     // Zero-sum: LP takes the opposite side
@@ -4310,8 +4353,8 @@ fn test_reserved_equality_invariant() {
     engine.insurance_fund.balance = U128::new(500);
     engine.vault = U128::new(500); // Keep conservation
 
-    engine.deposit(lp, 10_000).unwrap();
-    engine.deposit(user, 1_000).unwrap();
+    engine.deposit(lp, 10_000, 0).unwrap();
+    engine.deposit(user, 1_000, 0).unwrap();
 
     // Create warmed positive PnL by manually setting W+ and W-
     // Simulate: user warmed 200 in positive PnL, LP paid 50 in losses
@@ -4730,7 +4773,7 @@ fn test_withdraw_rejected_when_closed_and_negative_pnl_full_amount() {
     let user_idx = engine.add_user(0).unwrap();
 
     // Setup: deposit 1000, no position, negative pnl of -300
-    let _ = engine.deposit(user_idx, 1000);
+    let _ = engine.deposit(user_idx, 1000, 0);
     engine.accounts[user_idx as usize].pnl = I128::new(-300);
     engine.accounts[user_idx as usize].position_size = I128::new(0);
 
@@ -4752,7 +4795,7 @@ fn test_withdraw_allows_remaining_principal_after_loss_settlement() {
     let user_idx = engine.add_user(0).unwrap();
 
     // Setup: deposit 1000, no position, negative pnl of -300
-    let _ = engine.deposit(user_idx, 1000);
+    let _ = engine.deposit(user_idx, 1000, 0);
     engine.accounts[user_idx as usize].pnl = I128::new(-300);
     engine.accounts[user_idx as usize].position_size = I128::new(0);
 
@@ -4774,7 +4817,7 @@ fn test_insolvent_account_blocks_any_withdrawal() {
     let user_idx = engine.add_user(0).unwrap();
 
     // Setup: deposit 500, no position, negative pnl of -800 (exceeds capital)
-    let _ = engine.deposit(user_idx, 500);
+    let _ = engine.deposit(user_idx, 500, 0);
     engine.accounts[user_idx as usize].pnl = I128::new(-800);
     engine.accounts[user_idx as usize].position_size = I128::new(0);
 
@@ -4797,7 +4840,7 @@ fn test_withdraw_im_check_blocks_when_equity_below_im() {
 
     // Setup: capital = 150, pnl = 0, position = 1000, entry_price = 1_000_000
     // notional = 1000, IM = 1000 * 1000 / 10000 = 100
-    let _ = engine.deposit(user_idx, 150);
+    let _ = engine.deposit(user_idx, 150, 0);
     engine.accounts[user_idx as usize].pnl = I128::new(0);
     engine.accounts[user_idx as usize].position_size = I128::new(1000);
     engine.accounts[user_idx as usize].entry_price = 1_000_000;
@@ -4830,8 +4873,8 @@ fn test_keeper_crank_liquidates_undercollateralized_user() {
     // Create user and LP
     let user = engine.add_user(0).unwrap();
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    let _ = engine.deposit(user, 10_000);
-    let _ = engine.deposit(lp, 100_000);
+    let _ = engine.deposit(user, 10_000, 0);
+    let _ = engine.deposit(lp, 100_000, 0);
 
     // Give user a long position at entry price 1.0
     engine.accounts[user as usize].position_size = I128::new(1_000_000); // 1 unit
@@ -5190,7 +5233,7 @@ fn test_gc_fee_drained_dust() {
 
     // Create user with small capital
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 500).unwrap();
+    engine.deposit(user, 500, 0).unwrap();
 
     assert!(engine.is_used(user as usize), "User should exist");
 
@@ -5239,7 +5282,7 @@ fn test_gc_negative_pnl_socialized() {
 
     // Create counterparty with matching positive PnL for zero-sum
     let counterparty = engine.add_user(0).unwrap();
-    engine.deposit(counterparty, 1000).unwrap(); // Needs capital to exist
+    engine.deposit(counterparty, 1000, 0).unwrap(); // Needs capital to exist
     engine.accounts[counterparty as usize].pnl = I128::new(500); // Counterparty gains
     // Keep PnL unwrapped (not warmed) so socialization can haircut it
     engine.accounts[counterparty as usize].warmup_slope_per_step = U128::new(0);
@@ -5289,7 +5332,7 @@ fn test_gc_with_position_not_collected() {
 
     let user = engine.add_user(0).unwrap();
     // Add enough capital to avoid liquidation, then set position
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
     engine.accounts[user as usize].position_size = I128::new(1000);
     engine.accounts[user as usize].entry_price = 1_000_000;
     engine.total_open_interest = U128::new(1000);
@@ -5327,7 +5370,7 @@ fn test_batched_adl_profit_exclusion() {
     // Socialization haircuts unwrapped PnL (not yet warmed), so keep slope=0.
     // Target 1: has realized profit of 20,000
     let adl_target1 = engine.add_user(0).unwrap();
-    engine.deposit(adl_target1, 50_000).unwrap();
+    engine.deposit(adl_target1, 50_000, 0).unwrap();
     engine.accounts[adl_target1 as usize].pnl = I128::new(20_000); // Realized profit
     // Keep PnL unwrapped (not warmed) so socialization can haircut it
     engine.accounts[adl_target1 as usize].warmup_slope_per_step = U128::new(0);
@@ -5335,21 +5378,21 @@ fn test_batched_adl_profit_exclusion() {
 
     // Target 2: Also has realized profit
     let adl_target2 = engine.add_user(0).unwrap();
-    engine.deposit(adl_target2, 50_000).unwrap();
+    engine.deposit(adl_target2, 50_000, 0).unwrap();
     engine.accounts[adl_target2 as usize].pnl = I128::new(20_000); // Realized profit
     engine.accounts[adl_target2 as usize].warmup_slope_per_step = U128::new(0);
     engine.accounts[adl_target2 as usize].warmup_started_at_slot = 0;
 
     // Create a counterparty with negative pnl to balance the targets (for conservation)
     let counterparty = engine.add_user(0).unwrap();
-    engine.deposit(counterparty, 100_000).unwrap();
+    engine.deposit(counterparty, 100_000, 0).unwrap();
     engine.accounts[counterparty as usize].pnl = I128::new(-40_000); // Negative pnl balances targets
 
     // Create the account to be liquidated: long from 0.8, so has PROFIT at 0.81
     // But with very low capital, maintenance margin will fail.
     // This creates a "winner liquidation" - account with positive mark_pnl gets liquidated.
     let winner_liq = engine.add_user(0).unwrap();
-    engine.deposit(winner_liq, 1_000).unwrap(); // Only 1000 capital
+    engine.deposit(winner_liq, 1_000, 0).unwrap(); // Only 1000 capital
     engine.accounts[winner_liq as usize].position_size = I128::new(1_000_000); // Long 1 unit
     engine.accounts[winner_liq as usize].entry_price = 800_000;     // Entered at 0.8
     // Counterparty short position for zero-sum
@@ -5421,13 +5464,13 @@ fn test_batched_adl_conservation_basic() {
     // Create two users with opposing positions (zero-sum)
     // Give them plenty of capital so they're well above maintenance
     let long = engine.add_user(0).unwrap();
-    engine.deposit(long, 200_000).unwrap();  // Well above 5% of 1M = 50k
+    engine.deposit(long, 200_000, 0).unwrap();  // Well above 5% of 1M = 50k
     engine.accounts[long as usize].position_size = I128::new(1_000_000);
     engine.accounts[long as usize].entry_price = 1_000_000;
     engine.total_open_interest = U128::new(1_000_000);
 
     let short = engine.add_user(0).unwrap();
-    engine.deposit(short, 200_000).unwrap();  // Well above 5% of 1M = 50k
+    engine.deposit(short, 200_000, 0).unwrap();  // Well above 5% of 1M = 50k
     engine.accounts[short as usize].position_size = I128::new(-1_000_000);
     engine.accounts[short as usize].entry_price = 1_000_000;
     engine.total_open_interest = U128::new(engine.total_open_interest.get() + 1_000_000);
@@ -5477,7 +5520,7 @@ fn test_two_phase_liquidation_priority_and_sweep() {
 
     // Healthy counterparty to take other side of positions
     let counterparty = engine.add_user(0).unwrap();
-    engine.deposit(counterparty, 10_000_000).unwrap();
+    engine.deposit(counterparty, 10_000_000, 0).unwrap();
 
     // Create underwater accounts with different severities
     // At oracle 1.0: maintenance = 5% of notional
@@ -5485,7 +5528,7 @@ fn test_two_phase_liquidation_priority_and_sweep() {
 
     // Mildly underwater (capital = 45k, needs 50k)
     let mild = engine.add_user(0).unwrap();
-    engine.deposit(mild, 45_000).unwrap();
+    engine.deposit(mild, 45_000, 0).unwrap();
     engine.accounts[mild as usize].position_size = I128::new(1_000_000);
     engine.accounts[mild as usize].entry_price = 1_000_000;
     engine.accounts[counterparty as usize].position_size -= 1_000_000;
@@ -5494,7 +5537,7 @@ fn test_two_phase_liquidation_priority_and_sweep() {
 
     // Severely underwater (capital = 10k, needs 50k)
     let severe = engine.add_user(0).unwrap();
-    engine.deposit(severe, 10_000).unwrap();
+    engine.deposit(severe, 10_000, 0).unwrap();
     engine.accounts[severe as usize].position_size = I128::new(1_000_000);
     engine.accounts[severe as usize].entry_price = 1_000_000;
     engine.accounts[counterparty as usize].position_size -= 1_000_000;
@@ -5502,7 +5545,7 @@ fn test_two_phase_liquidation_priority_and_sweep() {
 
     // Very severely underwater (capital = 1k, needs 50k)
     let very_severe = engine.add_user(0).unwrap();
-    engine.deposit(very_severe, 1_000).unwrap();
+    engine.deposit(very_severe, 1_000, 0).unwrap();
     engine.accounts[very_severe as usize].position_size = I128::new(1_000_000);
     engine.accounts[very_severe as usize].entry_price = 1_000_000;
     engine.accounts[counterparty as usize].position_size -= 1_000_000;
@@ -5580,12 +5623,12 @@ fn test_force_realize_losses_conservation_with_profit_and_loss() {
 
     // Create two accounts with opposing positions
     let winner = engine.add_user(0).unwrap();
-    engine.deposit(winner, 50_000).unwrap();
+    engine.deposit(winner, 50_000, 0).unwrap();
     engine.accounts[winner as usize].position_size = I128::new(1_000_000); // Long
     engine.accounts[winner as usize].entry_price = 900_000; // Entered at 0.9
 
     let loser = engine.add_user(0).unwrap();
-    engine.deposit(loser, 50_000).unwrap();
+    engine.deposit(loser, 50_000, 0).unwrap();
     engine.accounts[loser as usize].position_size = I128::new(-1_000_000); // Short (counterparty)
     engine.accounts[loser as usize].entry_price = 900_000;
 
@@ -5662,7 +5705,7 @@ fn test_window_liquidation_many_accounts_few_liquidatable() {
 
     // Counterparty for opposing positions
     let counterparty = engine.add_user(0).unwrap();
-    engine.deposit(counterparty, 100_000_000).unwrap();
+    engine.deposit(counterparty, 100_000_000, 0).unwrap();
 
     let mut underwater_indices = Vec::new();
 
@@ -5671,11 +5714,11 @@ fn test_window_liquidation_many_accounts_few_liquidatable() {
 
         if i < num_underwater {
             // Underwater: low capital, will fail maintenance
-            engine.deposit(user, 1_000).unwrap();
+            engine.deposit(user, 1_000, 0).unwrap();
             underwater_indices.push(user);
         } else {
             // Healthy: plenty of capital
-            engine.deposit(user, 200_000).unwrap();
+            engine.deposit(user, 200_000, 0).unwrap();
         }
 
         // All have positions
@@ -5731,14 +5774,14 @@ fn test_window_liquidation_many_liquidatable() {
 
     // Counterparty with lots of capital
     let counterparty = engine.add_user(0).unwrap();
-    engine.deposit(counterparty, 100_000_000).unwrap();
+    engine.deposit(counterparty, 100_000_000, 0).unwrap();
 
     // Create underwater accounts
     for i in 0..num_underwater {
         let user = engine.add_user(0).unwrap();
         // Vary capital: 10_000 to 40_000 (underwater for 5% margin on 1M position = 50k needed)
         let capital = 10_000 + (i as u128 * 3_000);
-        engine.deposit(user, capital).unwrap();
+        engine.deposit(user, capital, 0).unwrap();
         engine.accounts[user as usize].position_size = I128::new(1_000_000);
         engine.accounts[user as usize].entry_price = 1_000_000;
         engine.accounts[counterparty as usize].position_size -= 1_000_000;
@@ -5779,16 +5822,16 @@ fn test_force_realize_step_closes_in_window_only() {
 
     // Create counterparty LP
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, 50_000).unwrap();
+    engine.deposit(lp, 50_000, 0).unwrap();
 
     // Create users with positions at different indices
     let user1 = engine.add_user(0).unwrap(); // idx 1, in first window
     let user2 = engine.add_user(0).unwrap(); // idx 2, in first window
     let user3 = engine.add_user(0).unwrap(); // idx 3, in first window
 
-    engine.deposit(user1, 5_000).unwrap();
-    engine.deposit(user2, 5_000).unwrap();
-    engine.deposit(user3, 5_000).unwrap();
+    engine.deposit(user1, 5_000, 0).unwrap();
+    engine.deposit(user2, 5_000, 0).unwrap();
+    engine.deposit(user3, 5_000, 0).unwrap();
 
     // Give them positions
     engine.accounts[user1 as usize].position_size = I128::new(10_000);
@@ -5840,11 +5883,11 @@ fn test_force_realize_step_inert_above_threshold() {
 
     // Create counterparty LP
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, 50_000).unwrap();
+    engine.deposit(lp, 50_000, 0).unwrap();
 
     // Create user with position (must be >= min_liquidation_abs to avoid dust-closure)
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 100_000).unwrap();
+    engine.deposit(user, 100_000, 0).unwrap();
     engine.accounts[user as usize].position_size = I128::new(200_000);
     engine.accounts[user as usize].entry_price = 1_000_000;
     engine.accounts[lp as usize].position_size = I128::new(-200_000);
@@ -5888,11 +5931,11 @@ fn test_crank_force_closes_dust_positions() {
 
     // Create counterparty LP
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, 50_000).unwrap();
+    engine.deposit(lp, 50_000, 0).unwrap();
 
     // Create user with DUST position (below min_liquidation_abs)
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
     engine.accounts[user as usize].position_size = I128::new(50_000); // Below 100k threshold
     engine.accounts[user as usize].entry_price = 1_000_000;
     engine.accounts[lp as usize].position_size = I128::new(-50_000);
@@ -5937,11 +5980,11 @@ fn test_force_realize_produces_pending_and_finalize_resolves() {
 
     // Create counterparty LP with large position
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, 50_000).unwrap();
+    engine.deposit(lp, 50_000, 0).unwrap();
 
     // Create losing user with insufficient capital to cover loss
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 1_000).unwrap(); // Only 1000 capital
+    engine.deposit(user, 1_000, 0).unwrap(); // Only 1000 capital
 
     // User is long, price dropped significantly
     engine.accounts[user as usize].position_size = I128::new(10_000);
@@ -5998,7 +6041,7 @@ fn test_force_realize_blocks_value_extraction() {
 
     // Create user with capital
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
 
     // Manually set pending to simulate post-force-realize state
     engine.pending_unpaid_loss = U128::new(100);
@@ -6114,11 +6157,11 @@ fn test_force_realize_updates_lp_aggregates() {
 
     // Create LP with position
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, 50_000).unwrap();
+    engine.deposit(lp, 50_000, 0).unwrap();
 
     // Create user as counterparty
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 50_000).unwrap();
+    engine.deposit(user, 50_000, 0).unwrap();
 
     // Set up positions
     engine.accounts[lp as usize].position_size = I128::new(-1_000_000); // Short 1 unit
@@ -6171,7 +6214,7 @@ fn test_withdrawals_blocked_during_pending_unblocked_after() {
 
     // Create user with capital
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 10_000).unwrap();
+    engine.deposit(user, 10_000, 0).unwrap();
 
     // Crank to establish baseline
     engine.keeper_crank(u16::MAX, 1, 1_000_000, 0, false).unwrap();
