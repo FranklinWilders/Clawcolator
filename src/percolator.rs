@@ -46,11 +46,9 @@ const ACCOUNT_IDX_MASK: usize = MAX_ACCOUNTS - 1;
 /// Limits compute usage while still making progress on cleanup.
 pub const GC_CLOSE_BUDGET: u32 = 32;
 
-/// Number of crank steps to complete a full sweep (16 steps × 256 = 4096)
-pub const NUM_STEPS: u8 = 16;
-
-/// Accounts scanned per crank step in the deterministic sweep
-pub const WINDOW: usize = 256;
+/// Number of occupied accounts to process per crank call.
+/// When the system has fewer than this many accounts, one crank covers everything.
+pub const ACCOUNTS_PER_CRANK: u16 = 256;
 
 /// Hard liquidation budget per crank call (caps total work)
 /// Set to 120 to keep worst-case crank CU under ~50% of Solana limit
@@ -79,13 +77,198 @@ pub const MAX_POSITION_ABS: u128 = 100_000_000_000_000_000_000;
 //
 // These wrapper types use [u64; 2] internally to ensure consistent 8-byte alignment
 // across all platforms. See: https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
+//
+// KANI OPTIMIZATION: For Kani builds, we use transparent newtypes around raw
+// primitives. This dramatically reduces SAT solver complexity since Kani doesn't
+// have to reason about bit-shifting and array indexing for every 128-bit operation.
 
+// ============================================================================
+// I128 - Kani-optimized version (transparent newtype)
+// ============================================================================
+#[cfg(kani)]
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct I128(i128);
+
+#[cfg(kani)]
+impl I128 {
+    pub const ZERO: Self = Self(0);
+    pub const MIN: Self = Self(i128::MIN);
+    pub const MAX: Self = Self(i128::MAX);
+
+    #[inline(always)]
+    pub const fn new(val: i128) -> Self { Self(val) }
+
+    #[inline(always)]
+    pub const fn get(self) -> i128 { self.0 }
+
+    #[inline(always)]
+    pub fn set(&mut self, val: i128) { self.0 = val; }
+
+    #[inline(always)]
+    pub fn checked_add(self, rhs: i128) -> Option<Self> {
+        self.0.checked_add(rhs).map(Self)
+    }
+
+    #[inline(always)]
+    pub fn checked_sub(self, rhs: i128) -> Option<Self> {
+        self.0.checked_sub(rhs).map(Self)
+    }
+
+    #[inline(always)]
+    pub fn checked_mul(self, rhs: i128) -> Option<Self> {
+        self.0.checked_mul(rhs).map(Self)
+    }
+
+    #[inline(always)]
+    pub fn checked_div(self, rhs: i128) -> Option<Self> {
+        self.0.checked_div(rhs).map(Self)
+    }
+
+    #[inline(always)]
+    pub fn saturating_add(self, rhs: i128) -> Self {
+        Self(self.0.saturating_add(rhs))
+    }
+
+    #[inline(always)]
+    pub fn saturating_add_i128(self, rhs: I128) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+
+    #[inline(always)]
+    pub fn saturating_sub(self, rhs: i128) -> Self {
+        Self(self.0.saturating_sub(rhs))
+    }
+
+    #[inline(always)]
+    pub fn saturating_sub_i128(self, rhs: I128) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    #[inline(always)]
+    pub fn wrapping_add(self, rhs: i128) -> Self {
+        Self(self.0.wrapping_add(rhs))
+    }
+
+    #[inline(always)]
+    pub fn abs(self) -> Self { Self(self.0.abs()) }
+
+    #[inline(always)]
+    pub fn unsigned_abs(self) -> u128 { self.0.unsigned_abs() }
+
+    #[inline(always)]
+    pub fn is_zero(self) -> bool { self.0 == 0 }
+
+    #[inline(always)]
+    pub fn is_negative(self) -> bool { self.0 < 0 }
+
+    #[inline(always)]
+    pub fn is_positive(self) -> bool { self.0 > 0 }
+}
+
+// ============================================================================
+// I128 - BPF version (array-based for alignment)
+// ============================================================================
 /// BPF-safe signed 128-bit integer using [u64; 2] for consistent alignment.
 /// Layout: [lo, hi] in little-endian order.
+// Kani I128 trait implementations
+#[cfg(kani)]
+impl Default for I128 {
+    fn default() -> Self { Self::ZERO }
+}
+
+#[cfg(kani)]
+impl core::fmt::Debug for I128 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "I128({})", self.0)
+    }
+}
+
+#[cfg(kani)]
+impl core::fmt::Display for I128 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(kani)]
+impl From<i128> for I128 {
+    fn from(val: i128) -> Self { Self(val) }
+}
+
+#[cfg(kani)]
+impl From<i64> for I128 {
+    fn from(val: i64) -> Self { Self(val as i128) }
+}
+
+#[cfg(kani)]
+impl From<I128> for i128 {
+    fn from(val: I128) -> Self { val.0 }
+}
+
+#[cfg(kani)]
+impl PartialOrd for I128 {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(kani)]
+impl Ord for I128 {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+#[cfg(kani)]
+impl core::ops::Add<i128> for I128 {
+    type Output = Self;
+    fn add(self, rhs: i128) -> Self { Self(self.0.saturating_add(rhs)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Add<I128> for I128 {
+    type Output = Self;
+    fn add(self, rhs: I128) -> Self { Self(self.0.saturating_add(rhs.0)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Sub<i128> for I128 {
+    type Output = Self;
+    fn sub(self, rhs: i128) -> Self { Self(self.0.saturating_sub(rhs)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Sub<I128> for I128 {
+    type Output = Self;
+    fn sub(self, rhs: I128) -> Self { Self(self.0.saturating_sub(rhs.0)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Neg for I128 {
+    type Output = Self;
+    fn neg(self) -> Self { Self(self.0.saturating_neg()) }
+}
+
+#[cfg(kani)]
+impl core::ops::AddAssign<i128> for I128 {
+    fn add_assign(&mut self, rhs: i128) { *self = *self + rhs; }
+}
+
+#[cfg(kani)]
+impl core::ops::SubAssign<i128> for I128 {
+    fn sub_assign(&mut self, rhs: i128) { *self = *self - rhs; }
+}
+
+// ============================================================================
+// I128 - BPF version (array-based for alignment)
+// ============================================================================
+#[cfg(not(kani))]
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct I128([u64; 2]);
 
+#[cfg(not(kani))]
 impl I128 {
     pub const ZERO: Self = Self([0, 0]);
     pub const MIN: Self = Self([0, 0x8000_0000_0000_0000]); // i128::MIN
@@ -179,52 +362,257 @@ impl I128 {
     }
 }
 
+#[cfg(not(kani))]
 impl Default for I128 {
     fn default() -> Self { Self::ZERO }
 }
 
+#[cfg(not(kani))]
 impl core::fmt::Debug for I128 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "I128({})", self.get())
     }
 }
 
+#[cfg(not(kani))]
 impl core::fmt::Display for I128 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.get())
     }
 }
 
+#[cfg(not(kani))]
 impl From<i128> for I128 {
     fn from(val: i128) -> Self { Self::new(val) }
 }
 
+#[cfg(not(kani))]
 impl From<i64> for I128 {
     fn from(val: i64) -> Self { Self::new(val as i128) }
 }
 
+#[cfg(not(kani))]
 impl From<I128> for i128 {
     fn from(val: I128) -> Self { val.get() }
 }
 
+#[cfg(not(kani))]
 impl PartialOrd for I128 {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(not(kani))]
 impl Ord for I128 {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.get().cmp(&other.get())
     }
 }
 
+// ============================================================================
+// U128 - Kani-optimized version (transparent newtype)
+// ============================================================================
+#[cfg(kani)]
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct U128(u128);
+
+#[cfg(kani)]
+impl U128 {
+    pub const ZERO: Self = Self(0);
+    pub const MAX: Self = Self(u128::MAX);
+
+    #[inline(always)]
+    pub const fn new(val: u128) -> Self { Self(val) }
+
+    #[inline(always)]
+    pub const fn get(self) -> u128 { self.0 }
+
+    #[inline(always)]
+    pub fn set(&mut self, val: u128) { self.0 = val; }
+
+    #[inline(always)]
+    pub fn checked_add(self, rhs: u128) -> Option<Self> {
+        self.0.checked_add(rhs).map(Self)
+    }
+
+    #[inline(always)]
+    pub fn checked_sub(self, rhs: u128) -> Option<Self> {
+        self.0.checked_sub(rhs).map(Self)
+    }
+
+    #[inline(always)]
+    pub fn checked_mul(self, rhs: u128) -> Option<Self> {
+        self.0.checked_mul(rhs).map(Self)
+    }
+
+    #[inline(always)]
+    pub fn checked_div(self, rhs: u128) -> Option<Self> {
+        self.0.checked_div(rhs).map(Self)
+    }
+
+    #[inline(always)]
+    pub fn saturating_add(self, rhs: u128) -> Self {
+        Self(self.0.saturating_add(rhs))
+    }
+
+    #[inline(always)]
+    pub fn saturating_add_u128(self, rhs: U128) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+
+    #[inline(always)]
+    pub fn saturating_sub(self, rhs: u128) -> Self {
+        Self(self.0.saturating_sub(rhs))
+    }
+
+    #[inline(always)]
+    pub fn saturating_sub_u128(self, rhs: U128) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    #[inline(always)]
+    pub fn saturating_mul(self, rhs: u128) -> Self {
+        Self(self.0.saturating_mul(rhs))
+    }
+
+    #[inline(always)]
+    pub fn wrapping_add(self, rhs: u128) -> Self {
+        Self(self.0.wrapping_add(rhs))
+    }
+
+    #[inline(always)]
+    pub fn max(self, rhs: Self) -> Self {
+        if self.0 >= rhs.0 { self } else { rhs }
+    }
+
+    #[inline(always)]
+    pub fn min(self, rhs: Self) -> Self {
+        if self.0 <= rhs.0 { self } else { rhs }
+    }
+
+    #[inline(always)]
+    pub fn is_zero(self) -> bool { self.0 == 0 }
+}
+
+#[cfg(kani)]
+impl Default for U128 {
+    fn default() -> Self { Self::ZERO }
+}
+
+#[cfg(kani)]
+impl core::fmt::Debug for U128 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "U128({})", self.0)
+    }
+}
+
+#[cfg(kani)]
+impl core::fmt::Display for U128 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(kani)]
+impl From<u128> for U128 {
+    fn from(val: u128) -> Self { Self(val) }
+}
+
+#[cfg(kani)]
+impl From<u64> for U128 {
+    fn from(val: u64) -> Self { Self(val as u128) }
+}
+
+#[cfg(kani)]
+impl From<U128> for u128 {
+    fn from(val: U128) -> Self { val.0 }
+}
+
+#[cfg(kani)]
+impl PartialOrd for U128 {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(kani)]
+impl Ord for U128 {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+#[cfg(kani)]
+impl core::ops::Add<u128> for U128 {
+    type Output = Self;
+    fn add(self, rhs: u128) -> Self { Self(self.0.saturating_add(rhs)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Add<U128> for U128 {
+    type Output = Self;
+    fn add(self, rhs: U128) -> Self { Self(self.0.saturating_add(rhs.0)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Sub<u128> for U128 {
+    type Output = Self;
+    fn sub(self, rhs: u128) -> Self { Self(self.0.saturating_sub(rhs)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Sub<U128> for U128 {
+    type Output = Self;
+    fn sub(self, rhs: U128) -> Self { Self(self.0.saturating_sub(rhs.0)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Mul<u128> for U128 {
+    type Output = Self;
+    fn mul(self, rhs: u128) -> Self { Self(self.0.saturating_mul(rhs)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Mul<U128> for U128 {
+    type Output = Self;
+    fn mul(self, rhs: U128) -> Self { Self(self.0.saturating_mul(rhs.0)) }
+}
+
+#[cfg(kani)]
+impl core::ops::Div<u128> for U128 {
+    type Output = Self;
+    fn div(self, rhs: u128) -> Self { Self(self.0 / rhs) }
+}
+
+#[cfg(kani)]
+impl core::ops::Div<U128> for U128 {
+    type Output = Self;
+    fn div(self, rhs: U128) -> Self { Self(self.0 / rhs.0) }
+}
+
+#[cfg(kani)]
+impl core::ops::AddAssign<u128> for U128 {
+    fn add_assign(&mut self, rhs: u128) { *self = *self + rhs; }
+}
+
+#[cfg(kani)]
+impl core::ops::SubAssign<u128> for U128 {
+    fn sub_assign(&mut self, rhs: u128) { *self = *self - rhs; }
+}
+
+// ============================================================================
+// U128 - BPF version (array-based for alignment)
+// ============================================================================
 /// BPF-safe unsigned 128-bit integer using [u64; 2] for consistent alignment.
 /// Layout: [lo, hi] in little-endian order.
+#[cfg(not(kani))]
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct U128([u64; 2]);
 
+#[cfg(not(kani))]
 impl U128 {
     pub const ZERO: Self = Self([0, 0]);
     pub const MAX: Self = Self([u64::MAX, u64::MAX]);
@@ -311,130 +699,156 @@ impl U128 {
     }
 }
 
+#[cfg(not(kani))]
 impl Default for U128 {
     fn default() -> Self { Self::ZERO }
 }
 
+#[cfg(not(kani))]
 impl core::fmt::Debug for U128 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "U128({})", self.get())
     }
 }
 
+#[cfg(not(kani))]
 impl core::fmt::Display for U128 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.get())
     }
 }
 
+#[cfg(not(kani))]
 impl From<u128> for U128 {
     fn from(val: u128) -> Self { Self::new(val) }
 }
 
+#[cfg(not(kani))]
 impl From<u64> for U128 {
     fn from(val: u64) -> Self { Self::new(val as u128) }
 }
 
+#[cfg(not(kani))]
 impl From<U128> for u128 {
     fn from(val: U128) -> Self { val.get() }
 }
 
+#[cfg(not(kani))]
 impl PartialOrd for U128 {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(not(kani))]
 impl Ord for U128 {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.get().cmp(&other.get())
     }
 }
 
-// Arithmetic operators for U128
+// Arithmetic operators for U128 (BPF version)
+#[cfg(not(kani))]
 impl core::ops::Add<u128> for U128 {
     type Output = Self;
     fn add(self, rhs: u128) -> Self { Self::new(self.get().saturating_add(rhs)) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Add<U128> for U128 {
     type Output = Self;
     fn add(self, rhs: U128) -> Self { Self::new(self.get().saturating_add(rhs.get())) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Sub<u128> for U128 {
     type Output = Self;
     fn sub(self, rhs: u128) -> Self { Self::new(self.get().saturating_sub(rhs)) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Sub<U128> for U128 {
     type Output = Self;
     fn sub(self, rhs: U128) -> Self { Self::new(self.get().saturating_sub(rhs.get())) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Mul<u128> for U128 {
     type Output = Self;
     fn mul(self, rhs: u128) -> Self { Self::new(self.get().saturating_mul(rhs)) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Mul<U128> for U128 {
     type Output = Self;
     fn mul(self, rhs: U128) -> Self { Self::new(self.get().saturating_mul(rhs.get())) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Div<u128> for U128 {
     type Output = Self;
     fn div(self, rhs: u128) -> Self { Self::new(self.get() / rhs) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Div<U128> for U128 {
     type Output = Self;
     fn div(self, rhs: U128) -> Self { Self::new(self.get() / rhs.get()) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::AddAssign<u128> for U128 {
     fn add_assign(&mut self, rhs: u128) { *self = *self + rhs; }
 }
 
+#[cfg(not(kani))]
 impl core::ops::SubAssign<u128> for U128 {
     fn sub_assign(&mut self, rhs: u128) { *self = *self - rhs; }
 }
 
-// Arithmetic operators for I128
+// Arithmetic operators for I128 (BPF version)
+#[cfg(not(kani))]
 impl core::ops::Add<i128> for I128 {
     type Output = Self;
     fn add(self, rhs: i128) -> Self { Self::new(self.get().saturating_add(rhs)) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Add<I128> for I128 {
     type Output = Self;
     fn add(self, rhs: I128) -> Self { Self::new(self.get().saturating_add(rhs.get())) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Sub<i128> for I128 {
     type Output = Self;
     fn sub(self, rhs: i128) -> Self { Self::new(self.get().saturating_sub(rhs)) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Sub<I128> for I128 {
     type Output = Self;
     fn sub(self, rhs: I128) -> Self { Self::new(self.get().saturating_sub(rhs.get())) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Mul<i128> for I128 {
     type Output = Self;
     fn mul(self, rhs: i128) -> Self { Self::new(self.get().saturating_mul(rhs)) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::Neg for I128 {
     type Output = Self;
     fn neg(self) -> Self { Self::new(-self.get()) }
 }
 
+#[cfg(not(kani))]
 impl core::ops::AddAssign<i128> for I128 {
     fn add_assign(&mut self, rhs: i128) { *self = *self + rhs; }
 }
 
+#[cfg(not(kani))]
 impl core::ops::SubAssign<i128> for I128 {
     fn sub_assign(&mut self, rhs: i128) { *self = *self - rhs; }
 }
@@ -796,11 +1210,14 @@ pub struct RiskEngine {
     /// Slot when the current full sweep started (step 0 was executed)
     pub last_full_sweep_start_slot: u64,
 
-    /// Slot when the last full sweep completed (step 7 finished)
+    /// Slot when the last full sweep completed
     pub last_full_sweep_completed_slot: u64,
 
-    /// Crank step within current sweep (0..7)
-    pub crank_step: u8,
+    /// Cursor: index where the next crank will start scanning
+    pub crank_cursor: u16,
+
+    /// Index where the current sweep started (for completion detection)
+    pub sweep_start_idx: u16,
 
     // ========================================
     // Lifetime Counters (telemetry)
@@ -931,6 +1348,10 @@ pub struct CrankOutcome {
     pub force_realize_closed: u16,
     /// Number of force-realize errors during this crank
     pub force_realize_errors: u16,
+    /// Index where this crank stopped (next crank continues from here)
+    pub last_cursor: u16,
+    /// Whether this crank completed a full sweep of all accounts
+    pub sweep_complete: bool,
 }
 
 // ============================================================================
@@ -1125,7 +1546,8 @@ impl RiskEngine {
             gc_cursor: 0,
             last_full_sweep_start_slot: 0,
             last_full_sweep_completed_slot: 0,
-            crank_step: 0,
+            crank_cursor: 0,
+            sweep_start_idx: 0,
             lifetime_liquidations: 0,
             lifetime_force_realize_closes: 0,
             net_lp_pos: I128::ZERO,
@@ -1660,8 +2082,8 @@ impl RiskEngine {
         let mut to_free: [u16; GC_CLOSE_BUDGET as usize] = [0; GC_CLOSE_BUDGET as usize];
         let mut num_to_free = 0usize;
 
-        // Fixed WINDOW per crank step, capped to MAX_ACCOUNTS to avoid wrap-around
-        let max_scan = if WINDOW < MAX_ACCOUNTS { WINDOW } else { MAX_ACCOUNTS };
+        // Scan up to ACCOUNTS_PER_CRANK slots, capped to MAX_ACCOUNTS
+        let max_scan = (ACCOUNTS_PER_CRANK as usize).min(MAX_ACCOUNTS);
         let start = self.gc_cursor as usize;
 
         for offset in 0..max_scan {
@@ -1778,15 +2200,23 @@ impl RiskEngine {
     ///
     /// Behavior:
     /// 1. Accrue funding
-    /// 2. If now_slot <= last_crank_slot, return early (no-op)
-    /// 3. Else advance last_crank_slot
-    /// 4. Settle maintenance fees for caller
-    /// 5. Evaluate heavy actions (force_realize, panic_settle)
+    /// 2. Advance last_crank_slot if now_slot > last_crank_slot
+    /// 3. Settle maintenance fees for caller (50% discount)
+    /// 4. Process up to ACCOUNTS_PER_CRANK occupied accounts:
+    ///    - Liquidation (if not in force-realize mode)
+    ///    - Force-realize (if insurance at/below threshold)
+    ///    - Socialization (haircut profits to cover losses)
+    ///    - LP max tracking
+    /// 5. Detect and finalize full sweep completion
     ///
     /// This is the single permissionless "do-the-right-thing" entrypoint.
     /// - Always attempts caller's maintenance settle with 50% discount (best-effort)
     /// - Only advances last_crank_slot when now_slot > last_crank_slot
-    /// - Heavy actions run independent of caller settle success
+    /// - Returns last_cursor: the index where this crank stopped
+    /// - Returns sweep_complete: true if this crank completed a full sweep
+    ///
+    /// When the system has fewer than ACCOUNTS_PER_CRANK accounts, one crank
+    /// covers all accounts and completes a full sweep.
     pub fn keeper_crank(
         &mut self,
         caller_idx: u16,
@@ -1803,8 +2233,9 @@ impl RiskEngine {
         // Update current_slot so warmup/bookkeeping progresses consistently
         self.current_slot = now_slot;
 
-        // If starting a new sweep (step 0), record the start slot and reset state
-        if self.crank_step == 0 {
+        // Detect if this is the start of a new sweep
+        let starting_new_sweep = self.crank_cursor == self.sweep_start_idx;
+        if starting_new_sweep {
             self.last_full_sweep_start_slot = now_slot;
             // Increment epochs (wrapping) - avoids O(MAX_ACCOUNTS) clears
             self.pending_epoch = self.pending_epoch.wrapping_add(1);
@@ -1822,50 +2253,206 @@ impl RiskEngine {
         }
 
         // Always attempt caller's maintenance settle (best-effort, no timestamp games)
-        // Use best-effort settle so undercollateralized callers can't get rebates
         let (slots_forgiven, caller_settle_ok) = if (caller_idx as usize) < MAX_ACCOUNTS
             && self.is_used(caller_idx as usize)
         {
-            // Compute forgiveness for reporting only (don't mutate before settle)
             let last_fee = self.accounts[caller_idx as usize].last_fee_slot;
             let dt = now_slot.saturating_sub(last_fee);
             let forgive = dt / 2;
 
-            // Use best-effort settle - always succeeds, no margin check
-            // Forgiveness is applied by only charging for half the elapsed time
             if forgive > 0 && dt > 0 {
-                // Apply forgiveness: advance last_fee_slot by half, then settle for rest
                 self.accounts[caller_idx as usize].last_fee_slot =
                     last_fee.saturating_add(forgive);
             }
             let settle_result = self.settle_maintenance_fee_best_effort_for_crank(caller_idx, now_slot);
-
             (forgive, settle_result.is_ok())
         } else {
-            (0, true) // No caller to settle, considered ok
+            (0, true)
         };
 
-        // Window sweep with hard budget:
-        // Window is defined by crank_step (deterministic), not liq_cursor
-        // Use window_len as stride so sweep is meaningful even when MAX_ACCOUNTS < WINDOW
-        let window_len = WINDOW.min(MAX_ACCOUNTS);
-        let window_start = (self.crank_step as usize * window_len) & ACCOUNT_IDX_MASK;
+        // Detect conditions for informational flags (before processing)
+        let force_realize_active = self.force_realize_active();
 
-        // Skip liquidation when force-realize is active (insurance at/below threshold).
-        // Force-realize closes ALL positions; liquidation just adds unnecessary CU.
-        let (num_liquidations, num_liq_errors) = if self.force_realize_active() {
-            (0, 0)
-        } else {
-            // Single-pass window sweep with hard budget
-            let (_sweep_checked, sweep_liqs, sweep_errors) =
-                self.scan_and_liquidate_window(now_slot, oracle_price, window_start, window_len as u16, LIQ_BUDGET_PER_CRANK);
-            (sweep_liqs as u32, sweep_errors)
-        };
+        // Process up to ACCOUNTS_PER_CRANK occupied accounts
+        let mut num_liquidations: u32 = 0;
+        let mut num_liq_errors: u16 = 0;
+        let mut force_realize_closed: u16 = 0;
+        let mut force_realize_errors: u16 = 0;
+        let mut sweep_complete = false;
+        let mut accounts_processed: u16 = 0;
+        let mut liq_budget = LIQ_BUDGET_PER_CRANK;
+        let mut force_realize_budget = FORCE_REALIZE_BUDGET_PER_CRANK;
 
-        // Windowed force-realize step: when insurance is at/below threshold,
-        // force-close positions in the current window. This is bounded to O(WINDOW).
-        let (force_realize_closed, force_realize_errors) =
-            self.force_realize_step_window(now_slot, oracle_price, window_start, window_len);
+        let epoch = self.pending_epoch;
+        let effective_slot = self.effective_warmup_slot();
+        let start_cursor = self.crank_cursor;
+
+        // Iterate through index space looking for occupied accounts
+        let mut idx = self.crank_cursor as usize;
+        let mut slots_scanned: usize = 0;
+
+        while accounts_processed < ACCOUNTS_PER_CRANK && slots_scanned < MAX_ACCOUNTS {
+            slots_scanned += 1;
+
+            // Check if slot is used
+            let block = idx >> 6;
+            let bit = idx & 63;
+            let is_occupied = (self.used[block] & (1u64 << bit)) != 0;
+
+            if is_occupied {
+                accounts_processed += 1;
+
+                // === Liquidation (if not in force-realize mode) ===
+                if !force_realize_active && liq_budget > 0 {
+                    if !self.accounts[idx].position_size.is_zero() {
+                        match self.liquidate_at_oracle_deferred_adl(idx as u16, now_slot, oracle_price) {
+                            Ok((true, deferred)) => {
+                                num_liquidations += 1;
+                                liq_budget = liq_budget.saturating_sub(1);
+                                self.lifetime_liquidations = self.lifetime_liquidations.saturating_add(1);
+                                self.pending_profit_to_fund = self
+                                    .pending_profit_to_fund
+                                    .saturating_add(deferred.profit_to_fund);
+                                self.pending_unpaid_loss = self
+                                    .pending_unpaid_loss
+                                    .saturating_add(deferred.unpaid_loss);
+                                if deferred.excluded {
+                                    self.pending_exclude_epoch[idx] = epoch;
+                                }
+                            }
+                            Ok((false, _)) => {}
+                            Err(_) => {
+                                num_liq_errors += 1;
+                                self.risk_reduction_only = true;
+                            }
+                        }
+                    }
+
+                    // Force-close negative equity or dust positions
+                    if !self.accounts[idx].position_size.is_zero() {
+                        let equity = self.account_equity_mtm_at_oracle(&self.accounts[idx], oracle_price);
+                        let abs_pos = self.accounts[idx].position_size.unsigned_abs();
+                        let is_dust = abs_pos < self.params.min_liquidation_abs.get();
+
+                        if equity == 0 || is_dust {
+                            match self.force_close_position_deferred(idx, oracle_price) {
+                                Ok((_mark_pnl, deferred)) => {
+                                    self.lifetime_force_realize_closes =
+                                        self.lifetime_force_realize_closes.saturating_add(1);
+                                    self.pending_unpaid_loss = self
+                                        .pending_unpaid_loss
+                                        .saturating_add(deferred.unpaid_loss);
+                                }
+                                Err(_) => {
+                                    num_liq_errors += 1;
+                                    self.risk_reduction_only = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // === Force-realize (when insurance at/below threshold) ===
+                if force_realize_active && force_realize_budget > 0 {
+                    self.enter_risk_reduction_only_mode();
+
+                    if !self.accounts[idx].position_size.is_zero() {
+                        if self.touch_account_for_force_realize(idx as u16, now_slot).is_err() {
+                            force_realize_errors += 1;
+                            self.risk_reduction_only = true;
+                        } else {
+                            match self.force_close_position_deferred(idx, oracle_price) {
+                                Ok((mark_pnl, deferred)) => {
+                                    force_realize_closed += 1;
+                                    force_realize_budget = force_realize_budget.saturating_sub(1);
+                                    self.lifetime_force_realize_closes =
+                                        self.lifetime_force_realize_closes.saturating_add(1);
+                                    self.pending_unpaid_loss = self
+                                        .pending_unpaid_loss
+                                        .saturating_add(deferred.unpaid_loss);
+                                    if mark_pnl > 0 {
+                                        self.pending_unpaid_loss = self
+                                            .pending_unpaid_loss
+                                            .saturating_add(mark_pnl as u128);
+                                    }
+                                }
+                                Err(_) => {
+                                    force_realize_errors += 1;
+                                    self.risk_reduction_only = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // === Socialization (haircut profits to cover losses) ===
+                if !self.pending_profit_to_fund.is_zero() || !self.pending_unpaid_loss.is_zero() {
+                    let unwrapped = self.compute_unwrapped_pnl_at(&self.accounts[idx], effective_slot);
+                    if unwrapped > 0 {
+                        let mut remaining = unwrapped;
+
+                        // Pass 1: Profit funding (if not excluded)
+                        if !self.pending_profit_to_fund.is_zero() && self.pending_exclude_epoch[idx] != epoch {
+                            let take = core::cmp::min(remaining, self.pending_profit_to_fund.get());
+                            if take > 0 {
+                                self.accounts[idx].pnl =
+                                    self.accounts[idx].pnl.saturating_sub(take as i128);
+                                self.pending_profit_to_fund =
+                                    self.pending_profit_to_fund.saturating_sub(take);
+                                remaining = remaining.saturating_sub(take);
+                            }
+                        }
+
+                        // Pass 2: Loss socialization
+                        if !self.pending_unpaid_loss.is_zero() && remaining > 0 {
+                            let take = core::cmp::min(remaining, self.pending_unpaid_loss.get());
+                            if take > 0 {
+                                self.accounts[idx].pnl =
+                                    self.accounts[idx].pnl.saturating_sub(take as i128);
+                                self.pending_unpaid_loss =
+                                    self.pending_unpaid_loss.saturating_sub(take);
+                            }
+                        }
+                    }
+                }
+
+                // === LP max tracking ===
+                if self.accounts[idx].is_lp() {
+                    let abs_pos = self.accounts[idx].position_size.unsigned_abs();
+                    self.lp_max_abs_sweep = self.lp_max_abs_sweep.max(U128::new(abs_pos));
+                }
+            }
+
+            // Advance to next index (with wrap)
+            idx = (idx + 1) & ACCOUNT_IDX_MASK;
+
+            // Check for sweep completion: we've wrapped around to sweep_start_idx
+            // (and we've actually processed some slots, not just starting)
+            if idx == self.sweep_start_idx as usize && slots_scanned > 0 {
+                sweep_complete = true;
+                break;
+            }
+        }
+
+        // Update cursor for next crank
+        self.crank_cursor = idx as u16;
+
+        // If sweep complete, finalize
+        if sweep_complete {
+            self.finalize_pending_after_window();
+            self.last_full_sweep_completed_slot = now_slot;
+            self.lp_max_abs = self.lp_max_abs_sweep;
+            // Reset sweep_start_idx for next sweep
+            self.sweep_start_idx = self.crank_cursor;
+        }
+
+        // Recompute warmup insurance reserved if force-realize was active
+        if force_realize_active {
+            self.recompute_warmup_insurance_reserved();
+        }
+
+        // Garbage collect dust accounts
+        let num_gc_closed = self.garbage_collect_dust();
 
         // Detect conditions for informational flags
         let force_realize_needed = self.force_realize_active();
@@ -1873,43 +2460,6 @@ impl RiskEngine {
             && (!self.loss_accum.is_zero() || self.risk_reduction_only)
             && allow_panic
             && !self.total_open_interest.is_zero();
-
-        // Garbage collect dust accounts BEFORE socialization
-        // This ensures pending_unpaid_loss from GC'd accounts is available for haircuts
-        // in the current window (if victim is in the same window as the GC'd account).
-        let num_gc_closed = self.garbage_collect_dust();
-
-        // Bounded socialization: apply pending profit/loss haircuts to WINDOW accounts
-        self.socialization_step(window_start, window_len);
-
-        // Bounded lp_max_abs update: scan LP accounts in window
-        for offset in 0..window_len {
-            let idx = (window_start + offset) & ACCOUNT_IDX_MASK;
-            let block = idx >> 6;
-            let bit = idx & 63;
-            if (self.used[block] & (1u64 << bit)) == 0 {
-                continue;
-            }
-            if !self.accounts[idx].is_lp() {
-                continue;
-            }
-            let abs_pos = self.accounts[idx].position_size.unsigned_abs();
-            self.lp_max_abs_sweep = self.lp_max_abs_sweep.max(U128::new(abs_pos));
-        }
-
-        // Advance crank step; when completing final step, record completion and wrap
-        self.crank_step += 1;
-        if self.crank_step == NUM_STEPS {
-            // Full sweep complete - finalize pending now that all accounts have been scanned
-            // This ensures socialization has had a chance to haircut all positive PnL before
-            // spending insurance. Guarantees pending buckets can't remain non-zero forever (liveness).
-            self.finalize_pending_after_window();
-
-            self.crank_step = 0;
-            self.last_full_sweep_completed_slot = now_slot;
-            // Commit bounded lp_max_abs from sweep
-            self.lp_max_abs = self.lp_max_abs_sweep;
-        }
 
         Ok(CrankOutcome {
             advanced,
@@ -1922,6 +2472,8 @@ impl RiskEngine {
             num_gc_closed,
             force_realize_closed,
             force_realize_errors,
+            last_cursor: self.crank_cursor,
+            sweep_complete,
         })
     }
 

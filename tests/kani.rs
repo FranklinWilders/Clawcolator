@@ -242,7 +242,7 @@ fn valid_state(engine: &RiskEngine) -> bool {
     if engine.num_used_accounts > MAX_ACCOUNTS as u16 {
         return false;
     }
-    if engine.crank_step >= NUM_STEPS {
+    if engine.crank_cursor >= MAX_ACCOUNTS as u16 {
         return false;
     }
     if engine.gc_cursor >= MAX_ACCOUNTS as u16 {
@@ -360,7 +360,7 @@ fn inv_structural(engine: &RiskEngine) -> bool {
     }
 
     // S4: Crank state bounds
-    if engine.crank_step >= NUM_STEPS {
+    if engine.crank_cursor >= MAX_ACCOUNTS as u16 {
         return false;
     }
     if engine.gc_cursor >= MAX_ACCOUNTS as u16 {
@@ -741,6 +741,138 @@ fn i1_adl_never_reduces_principal() {
         engine.accounts[user_idx as usize].capital.get() == principal_before.get(),
         "I1: ADL must NEVER reduce user principal"
     );
+}
+
+// ============================================================================
+// I1b: ADL overflow soundness - tests that overflow doesn't leave partial state
+// This exercises the checked_mul overflow path in apply_adl with large values.
+// If overflow occurs mid-loop, earlier accounts may be modified before the error.
+// ============================================================================
+
+#[kani::proof]
+#[kani::unwind(33)]
+#[kani::solver(cadical)]
+fn i1b_adl_overflow_soundness() {
+    let mut engine = RiskEngine::new(test_params());
+
+    // Add two accounts to exercise the loop
+    let user1 = engine.add_user(0).unwrap();
+    let user2 = engine.add_user(1).unwrap();
+
+    // Use large but valid u128 values that could cause overflow in checked_mul
+    // loss_to_socialize * unwrapped could overflow if both are large
+    let loss: u128 = kani::any();
+    let pnl1: u128 = kani::any();
+    let pnl2: u128 = kani::any();
+    let capital1: u128 = kani::any();
+    let capital2: u128 = kani::any();
+
+    // Relax bounds significantly to exercise overflow paths
+    // Values up to 2^64 can overflow when multiplied: 2^64 * 2^64 = 2^128
+    kani::assume(loss > 0 && loss < (1u128 << 64));
+    kani::assume(pnl1 > 0 && pnl1 < (1u128 << 64));
+    kani::assume(pnl2 > 0 && pnl2 < (1u128 << 64));
+    kani::assume(capital1 > 0 && capital1 < (1u128 << 64));
+    kani::assume(capital2 > 0 && capital2 < (1u128 << 64));
+
+    // Set up accounts with positive PnL (will be haircut targets)
+    engine.accounts[user1 as usize].capital = U128::new(capital1);
+    engine.accounts[user1 as usize].pnl = I128::new(pnl1 as i128);
+    engine.accounts[user2 as usize].capital = U128::new(capital2);
+    engine.accounts[user2 as usize].pnl = I128::new(pnl2 as i128);
+
+    // Set insurance fund and vault
+    engine.insurance_fund.balance = U128::new(capital1.saturating_add(capital2));
+    engine.vault = U128::new(capital1.saturating_add(capital2).saturating_add(engine.insurance_fund.balance.get()));
+
+    // Capture state before
+    let pnl1_before = engine.accounts[user1 as usize].pnl;
+    let pnl2_before = engine.accounts[user2 as usize].pnl;
+    let capital1_before = engine.accounts[user1 as usize].capital;
+    let capital2_before = engine.accounts[user2 as usize].capital;
+
+    let result = engine.apply_adl(loss);
+
+    // SOUNDNESS: If operation failed, state should be unchanged (atomicity)
+    // This is the bug: if overflow happens on account 2 after account 1 was modified,
+    // account 1's state is changed but account 2's is not - inconsistent.
+    if result.is_err() {
+        assert!(
+            engine.accounts[user1 as usize].pnl.get() == pnl1_before.get() &&
+            engine.accounts[user2 as usize].pnl.get() == pnl2_before.get() &&
+            engine.accounts[user1 as usize].capital.get() == capital1_before.get() &&
+            engine.accounts[user2 as usize].capital.get() == capital2_before.get(),
+            "I1b: ADL overflow must not leave partial state modifications"
+        );
+    }
+
+    // Capital should never be reduced regardless of success/failure
+    assert!(
+        engine.accounts[user1 as usize].capital.get() >= capital1_before.get() ||
+        engine.accounts[user1 as usize].capital.get() == capital1_before.get(),
+        "I1b: ADL must never reduce capital"
+    );
+}
+
+// ============================================================================
+// I1c: ADL overflow atomicity - concrete test case that triggers overflow
+// Uses specific values designed to cause overflow on account 2 after
+// account 1 has already been modified, demonstrating the atomicity bug.
+// ============================================================================
+
+#[kani::proof]
+#[kani::unwind(33)]
+#[kani::solver(cadical)]
+fn i1c_adl_overflow_atomicity_concrete() {
+    let mut engine = RiskEngine::new(test_params());
+
+    // Add two accounts
+    let user1 = engine.add_user(0).unwrap();
+    let user2 = engine.add_user(1).unwrap();
+
+    // Concrete values to trigger overflow:
+    // Account 1: small unwrapped PnL (1) - processed first, won't overflow
+    // Account 2: large unwrapped PnL (2^120) - causes overflow when multiplied by loss
+    //
+    // loss_to_socialize = min(total_loss, total_unwrapped)
+    // For account 2: loss_to_socialize * unwrapped_2 can overflow
+    //
+    // If loss = 2^10 and unwrapped_2 = 2^120:
+    // 2^10 * 2^120 = 2^130 > 2^128 = u128::MAX -> OVERFLOW
+    let small_pnl: u128 = 1;
+    let large_pnl: u128 = 1u128 << 120; // 2^120
+    let total_loss: u128 = 1u128 << 10;  // 2^10 = 1024
+
+    // Set up accounts
+    engine.accounts[user1 as usize].capital = U128::new(1000);
+    engine.accounts[user1 as usize].pnl = I128::new(small_pnl as i128);
+    engine.accounts[user2 as usize].capital = U128::new(1000);
+    engine.accounts[user2 as usize].pnl = I128::new(large_pnl as i128);
+
+    // Vault must cover total capital
+    engine.vault = U128::new(2000);
+    engine.insurance_fund.balance = U128::new(10000);
+
+    // Capture state before
+    let pnl1_before = engine.accounts[user1 as usize].pnl.get();
+    let pnl2_before = engine.accounts[user2 as usize].pnl.get();
+
+    // This should trigger overflow in the multiplication for account 2
+    // After account 1 has already been processed
+    let result = engine.apply_adl(total_loss);
+
+    // If the operation returned an error (overflow), check atomicity
+    if result.is_err() {
+        // ATOMICITY CHECK: If error occurred, NO accounts should be modified
+        let pnl1_after = engine.accounts[user1 as usize].pnl.get();
+        let pnl2_after = engine.accounts[user2 as usize].pnl.get();
+
+        // This assertion will FAIL if account 1 was modified before account 2 caused overflow
+        assert!(
+            pnl1_after == pnl1_before && pnl2_after == pnl2_before,
+            "I1c: ADL overflow violated atomicity - account 1 modified before account 2 overflowed"
+        );
+    }
 }
 
 // ============================================================================
@@ -6451,7 +6583,7 @@ fn crank_bounds_respected() {
     let now_slot: u64 = kani::any();
     kani::assume(now_slot > 0 && now_slot < 10_000);
 
-    let crank_step_before = engine.crank_step;
+    let cursor_before = engine.crank_cursor;
 
     let result = engine.keeper_crank(user, now_slot, 1_000_000, 0, false);
     assert!(result.is_ok(), "keeper_crank should succeed");
@@ -6470,18 +6602,23 @@ fn crank_bounds_respected() {
         "CRANK-BOUNDS: num_gc_closed <= GC_CLOSE_BUDGET"
     );
 
-    // crank_step advances and wraps at NUM_STEPS
-    let expected_step = (crank_step_before + 1) % NUM_STEPS;
+    // crank_cursor advances (or wraps) after crank
     assert!(
-        engine.crank_step == expected_step,
-        "CRANK-BOUNDS: crank_step wraps at NUM_STEPS"
+        engine.crank_cursor != cursor_before || outcome.sweep_complete,
+        "CRANK-BOUNDS: crank_cursor advances or sweep completes"
     );
 
-    // last_full_sweep_completed_slot only updates when step wraps to 0
-    if engine.crank_step == 0 {
+    // last_cursor matches the returned cursor
+    assert!(
+        outcome.last_cursor == engine.crank_cursor,
+        "CRANK-BOUNDS: outcome.last_cursor matches engine.crank_cursor"
+    );
+
+    // last_full_sweep_completed_slot only updates when sweep completes
+    if outcome.sweep_complete {
         assert!(
             engine.last_full_sweep_completed_slot == now_slot,
-            "CRANK-BOUNDS: last_full_sweep_completed_slot updates on wrap"
+            "CRANK-BOUNDS: last_full_sweep_completed_slot updates on sweep complete"
         );
     }
 }
