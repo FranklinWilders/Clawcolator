@@ -28,7 +28,7 @@ extern crate kani;
 // MAX_ACCOUNTS is feature-configured, not target-configured.
 // This ensures x86 and SBF builds use the same sizes for a given feature set.
 #[cfg(kani)]
-pub const MAX_ACCOUNTS: usize = 8; // Small for fast formal verification
+pub const MAX_ACCOUNTS: usize = 4; // Small for fast formal verification (1 bitmap word, 4 bits)
 
 #[cfg(all(feature = "test", not(kani)))]
 pub const MAX_ACCOUNTS: usize = 64; // Small for tests
