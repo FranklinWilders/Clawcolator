@@ -141,6 +141,22 @@ When liquidations create deficits (profitable positions being closed), the syste
 
 This ensures losses are distributed fairly while maintaining bounded compute per transaction.
 
+#### Dust Position Cleanup
+
+Positions smaller than `min_liquidation_abs` (default: 100,000 units) are considered **dust** and are force-closed during crank. When a dust position is closed:
+
+1. The user's position is zeroed and their mark PnL is settled
+2. The LP's counterparty position is **not** adjusted
+
+This leaves the LP with an "orphaned" position that has no user counterpart. **This is by design:**
+
+- **LP absorbs market imbalances** — The LP was compensated for taking the counterparty risk when the original trade executed. Retaining residual directional exposure is part of LP's market-making role.
+- **PnL is settled at close time** — The dust position's mark PnL is calculated and settled at the oracle price. The LP's offsetting PnL was implicitly valued at that same price.
+- **Conservation invariant holds** — The critical property `vault >= capital + insurance` is preserved.
+- **Dust is economically insignificant** — Positions below `min_liquidation_abs` are tiny (e.g., 100k units ≈ 0.00077 SOL notional).
+
+The alternative (force-closing the LP's side too) would require identifying specific LP counterparties and force-closing positions they may want to keep, adding complexity without meaningful benefit.
+
 ### Closing Accounts
 
 `RiskEngine::close_account(...)` returns **capital only** after full settlement.
