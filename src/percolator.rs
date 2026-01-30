@@ -2164,8 +2164,8 @@ impl RiskEngine {
     ) -> Result<()> {
         // Funding settle is required for correct pnl
         self.touch_account(idx)?;
-        // Mark-to-market settlement (variation margin)
-        self.settle_mark_to_oracle(idx, oracle_price)?;
+        // Best-effort mark-to-market (saturating — never wedges on extreme PnL)
+        self.settle_mark_to_oracle_best_effort(idx, oracle_price)?;
         // Best-effort fees; margin check would just block the liquidation we need to do
         let _ = self.settle_maintenance_fee_best_effort_for_crank(idx, now_slot)?;
         Ok(())
@@ -2317,35 +2317,40 @@ impl RiskEngine {
                 continue;
             }
 
-            let account = &self.accounts[idx];
-
             // NEVER garbage collect LP accounts - they are essential for market operation
-            // LPs are identified by having a non-zero matcher_program
-            if account.matcher_program != [0u8; 32] {
+            if self.accounts[idx].is_lp() {
                 continue;
             }
+
+            // Best-effort fee settle so accounts with tiny capital get drained in THIS sweep.
+            let _ = self.settle_maintenance_fee_best_effort_for_crank(idx as u16, self.current_slot);
 
             // Dust predicate: must have zero position, capital, reserved, and non-positive pnl
-            if !account.position_size.is_zero() {
-                continue;
+            {
+                let account = &self.accounts[idx];
+                if !account.position_size.is_zero() {
+                    continue;
+                }
+                if !account.capital.is_zero() {
+                    continue;
+                }
+                if account.reserved_pnl != 0 {
+                    continue;
+                }
+                if account.pnl.is_positive() {
+                    continue;
+                }
             }
-            if !account.capital.is_zero() {
-                continue;
-            }
-            if account.reserved_pnl != 0 {
-                continue;
-            }
-            if account.pnl.is_positive() {
-                continue;
-            }
-            // Funding must be settled to avoid unsettled-value footgun
-            if account.funding_index != self.funding_index_qpb_e6 {
-                continue;
+
+            // If flat, funding is irrelevant — snap to global so dust can be collected.
+            // Position size is already confirmed zero above, so no unsettled funding value.
+            if self.accounts[idx].funding_index != self.funding_index_qpb_e6 {
+                self.accounts[idx].funding_index = self.funding_index_qpb_e6;
             }
 
             // Handle negative pnl by adding to pending bucket (no global ADL)
-            if account.pnl.is_negative() {
-                let loss = neg_i128_to_u128(account.pnl.get());
+            if self.accounts[idx].pnl.is_negative() {
+                let loss = neg_i128_to_u128(self.accounts[idx].pnl.get());
                 self.pending_unpaid_loss = self.pending_unpaid_loss + loss;
                 // Zero the pnl so account becomes true dust
                 self.accounts[idx].pnl = I128::ZERO;
@@ -2516,6 +2521,10 @@ impl RiskEngine {
 
             if is_occupied {
                 accounts_processed += 1;
+
+                // Always settle maintenance fees for every visited account.
+                // This drains idle accounts over time so they eventually become dust.
+                let _ = self.settle_maintenance_fee_best_effort_for_crank(idx as u16, now_slot);
 
                 // === Liquidation (if not in force-realize mode) ===
                 if !force_realize_active && liq_budget > 0 {
@@ -4132,6 +4141,37 @@ impl RiskEngine {
                 .checked_add(mark)
                 .ok_or(RiskError::Overflow)?,
         );
+
+        // Reset entry to oracle (mark PnL is now 0 at this price)
+        account.entry_price = oracle_price;
+
+        Ok(())
+    }
+
+    /// Best-effort mark-to-oracle settlement that uses saturating_add instead of
+    /// checked_add, so it never fails on overflow.  This prevents the liquidation
+    /// path from wedging on extreme mark PnL values.
+    fn settle_mark_to_oracle_best_effort(&mut self, idx: u16, oracle_price: u64) -> Result<()> {
+        if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
+
+        let account = &mut self.accounts[idx as usize];
+
+        if account.position_size.is_zero() {
+            account.entry_price = oracle_price;
+            return Ok(());
+        }
+
+        // Compute mark PnL at current oracle
+        let mark = Self::mark_pnl_for_position(
+            account.position_size.get(),
+            account.entry_price,
+            oracle_price,
+        )?;
+
+        // Realize the mark PnL (saturating — never fails on overflow)
+        account.pnl = I128::new(account.pnl.get().saturating_add(mark));
 
         // Reset entry to oracle (mark PnL is now 0 at this price)
         account.entry_price = oracle_price;
@@ -6168,6 +6208,113 @@ mod tests {
 
         // Conservation must still hold
         assert!(engine.check_conservation(ORACLE_100K));
+    }
+
+    #[test]
+    fn test_idle_user_drains_and_gc_closes() {
+        let mut params = params_for_tests();
+        // 1 unit per slot maintenance fee
+        params.maintenance_fee_per_slot = U128::new(1);
+        let mut engine = RiskEngine::new(params);
+
+        let user_idx = engine.add_user(0).unwrap();
+        // Deposit 10 units of capital
+        engine.deposit(user_idx, 10, 1).unwrap();
+
+        assert!(engine.is_used(user_idx as usize));
+
+        // Advance 1000 slots and crank — fee drains 1/slot * 1000 = 1000 >> 10 capital
+        let outcome = engine
+            .keeper_crank(user_idx, 1001, ORACLE_100K, 0, false)
+            .unwrap();
+
+        // Account should have been drained to 0 capital
+        // The crank settles fees and then GC sweeps dust
+        assert_eq!(outcome.num_gc_closed, 1, "expected GC to close the drained account");
+        assert!(!engine.is_used(user_idx as usize), "account should be freed");
+    }
+
+    #[test]
+    fn test_dust_stale_funding_gc() {
+        let mut engine = RiskEngine::new(params_for_tests());
+
+        let user_idx = engine.add_user(0).unwrap();
+
+        // Zero out the account: no capital, no position, no pnl
+        engine.accounts[user_idx as usize].capital = U128::ZERO;
+        engine.accounts[user_idx as usize].pnl = I128::ZERO;
+        engine.accounts[user_idx as usize].position_size = I128::ZERO;
+        engine.accounts[user_idx as usize].reserved_pnl = 0;
+
+        // Set a stale funding_index (different from global)
+        engine.accounts[user_idx as usize].funding_index = I128::new(999);
+        // Global funding index is 0 (default)
+        assert_ne!(
+            engine.accounts[user_idx as usize].funding_index,
+            engine.funding_index_qpb_e6
+        );
+
+        assert!(engine.is_used(user_idx as usize));
+
+        // Crank should snap funding and GC the dust account
+        let outcome = engine
+            .keeper_crank(user_idx, 10, ORACLE_100K, 0, false)
+            .unwrap();
+
+        assert_eq!(outcome.num_gc_closed, 1, "expected GC to close stale-funding dust");
+        assert!(!engine.is_used(user_idx as usize), "account should be freed");
+    }
+
+    #[test]
+    fn test_dust_negative_fee_credits_gc() {
+        let mut engine = RiskEngine::new(params_for_tests());
+
+        let user_idx = engine.add_user(0).unwrap();
+
+        // Zero out the account
+        engine.accounts[user_idx as usize].capital = U128::ZERO;
+        engine.accounts[user_idx as usize].pnl = I128::ZERO;
+        engine.accounts[user_idx as usize].position_size = I128::ZERO;
+        engine.accounts[user_idx as usize].reserved_pnl = 0;
+        // Set negative fee_credits (fee debt)
+        engine.accounts[user_idx as usize].fee_credits = I128::new(-123);
+
+        assert!(engine.is_used(user_idx as usize));
+
+        // Crank should GC this account — negative fee_credits doesn't block GC
+        let outcome = engine
+            .keeper_crank(user_idx, 10, ORACLE_100K, 0, false)
+            .unwrap();
+
+        assert_eq!(outcome.num_gc_closed, 1, "expected GC to close account with negative fee_credits");
+        assert!(!engine.is_used(user_idx as usize), "account should be freed");
+    }
+
+    #[test]
+    fn test_lp_never_gc() {
+        let mut params = params_for_tests();
+        params.maintenance_fee_per_slot = U128::new(1);
+        let mut engine = RiskEngine::new(params);
+
+        let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+        // Zero out the LP account to make it look like dust
+        engine.accounts[lp_idx as usize].capital = U128::ZERO;
+        engine.accounts[lp_idx as usize].pnl = I128::ZERO;
+        engine.accounts[lp_idx as usize].position_size = I128::ZERO;
+        engine.accounts[lp_idx as usize].reserved_pnl = 0;
+
+        assert!(engine.is_used(lp_idx as usize));
+
+        // Crank many times — LP should never be GC'd
+        for slot in 1..=10 {
+            let outcome = engine
+                .keeper_crank(lp_idx, slot * 100, ORACLE_100K, 0, false)
+                .unwrap();
+            assert_eq!(outcome.num_gc_closed, 0, "LP must not be garbage collected (slot {})", slot * 100);
+        }
+
+        assert!(engine.is_used(lp_idx as usize), "LP account must still exist");
     }
 }
 
