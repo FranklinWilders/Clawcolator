@@ -19,10 +19,10 @@ Percolator is a **hybrid**:
 - **Synthetics-style risk**: users take positions against **LP accounts** (inventory holders), and the engine enforces margin, liquidations, ADL/socialization, and withdrawal safety against a shared balance sheet.
 - **Orderbook-style execution extensibility**: LPs provide a **pluggable matcher program/context** (`MatchingEngine`) that can implement AMM/RFQ/CLOB logic and can **reject** trades.
 
-### Design clarifications (answers to review questions)
+### Design clarifications
 
 - **Users choose which LP to trade with.**  
-  Yes: the wrapper routes the trade to a specific LP account. The LP is not forced to take every trade: its **matcher** may reject, and the engine rejects if post-trade solvency fails.
+  The wrapper routes the trade to a specific LP account. The LP is not forced to take every trade: its **matcher** may reject, and the engine rejects if post-trade solvency fails.
 
 - **Liquidity fragmentation is possible at the execution layer.**  
   If users must target a specific LP account, then the maximum fill against that LP is bounded by that LP’s inventory/margin. Aggregation/routing across LPs is a **wrapper-level** feature.
