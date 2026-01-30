@@ -179,31 +179,33 @@ fn test_deposit_settles_accrued_maintenance_fees() {
     assert_eq!(engine.accounts[user_idx as usize].last_fee_slot, 0);
 
     // Deposit at slot 100 - should charge 100 * 10 = 1000 in fees
-    // But we're depositing 500, so:
-    // - 500 goes to pay fees (fee_credits goes from -1000 to -500)
-    // - 0 goes to capital
+    // Depositing 500:
+    //   - 500 from deposit pays fees → insurance += 500, fee_credits = -500
+    //   - 0 goes to capital
+    //   - pay_fee_debt_from_capital sweep: capital(1000) pays remaining 500 debt
+    //     → capital = 500, insurance += 500, fee_credits = 0
     let insurance_before = engine.insurance_fund.balance;
     engine.deposit(user_idx, 500, 100).unwrap();
 
     // Account's last_fee_slot should be updated
     assert_eq!(engine.accounts[user_idx as usize].last_fee_slot, 100);
 
-    // Capital should remain 1000 (deposit was consumed by fees)
-    assert_eq!(engine.accounts[user_idx as usize].capital.get(), 1000);
+    // Capital = 500 (was 1000, fee debt sweep paid 500)
+    assert_eq!(engine.accounts[user_idx as usize].capital.get(), 500);
 
-    // Insurance fund should have received 500 in fee revenue
+    // Insurance received 1000 total: 500 from deposit + 500 from capital sweep
     assert_eq!(
         (engine.insurance_fund.balance - insurance_before).get(),
-        500
+        1000
     );
 
-    // fee_credits should still be negative (-500)
-    assert_eq!(engine.accounts[user_idx as usize].fee_credits.get(), -500);
+    // fee_credits fully repaid by capital sweep
+    assert_eq!(engine.accounts[user_idx as usize].fee_credits.get(), 0);
 
-    // Now deposit 1000 more at slot 100 (no additional fees)
+    // Now deposit 1000 more at slot 100 (no additional fees, no debt)
     engine.deposit(user_idx, 1000, 100).unwrap();
 
-    // 500 pays remaining fees, 500 goes to capital
+    // All 1000 goes to capital (no debt to pay)
     assert_eq!(engine.accounts[user_idx as usize].capital.get(), 1500);
     assert_eq!(engine.accounts[user_idx as usize].fee_credits.get(), 0);
 
@@ -4707,9 +4709,11 @@ fn test_withdraw_open_position_blocks_due_to_equity() {
     let user_idx = engine.add_user(0).unwrap();
 
     // Setup: position_size = 1000, entry_price = 1_000_000
-    // notional = 1000, IM = 100
+    // notional = 1000, MM = 50, IM = 100
     // capital = 150, pnl = -100
-    // After settle: capital = 50, pnl = 0, equity = 50
+    // After warmup settle: capital = 50, pnl = 0, equity = 50
+    // equity(50) is NOT strictly > MM(50), so touch_account_full's
+    // post-settlement MM re-check fails with Undercollateralized.
 
     engine.accounts[user_idx as usize].capital = U128::new(150);
     engine.accounts[user_idx as usize].pnl = I128::new(-100);
@@ -4718,22 +4722,23 @@ fn test_withdraw_open_position_blocks_due_to_equity() {
     engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(0);
     engine.vault = U128::new(150);
 
-    // withdraw(60) should fail - loss settles first, then balance check fails
+    // withdraw(60) should fail - loss settles first, then MM re-check catches
+    // that equity(50) is not strictly above MM(50)
     let result = engine.withdraw(user_idx, 60, 0, 1_000_000);
     assert!(
-        result == Err(RiskError::InsufficientBalance),
-        "withdraw(60) must fail: after settling 100 loss, capital=50 < 60"
+        result == Err(RiskError::Undercollateralized),
+        "withdraw(60) must fail: after settling 100 loss, equity=50 not > MM=50"
     );
 
-    // Now capital = 50, pnl = 0
+    // Loss was settled during touch_account_full: capital = 50, pnl = 0
     assert_eq!(engine.accounts[user_idx as usize].capital.get(), 50);
     assert_eq!(engine.accounts[user_idx as usize].pnl.get(), 0);
 
-    // Try withdraw(40) - would leave 10 equity < 100 IM required
+    // Try withdraw(40) - same: equity(50) not > MM(50) so touch_account_full fails
     let result = engine.withdraw(user_idx, 40, 0, 1_000_000);
     assert!(
         result == Err(RiskError::Undercollateralized),
-        "withdraw(40) must fail: new_equity=10 < IM=100"
+        "withdraw(40) must fail: equity=50 not > MM=50"
     );
 }
 

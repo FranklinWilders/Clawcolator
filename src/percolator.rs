@@ -2066,6 +2066,7 @@ impl RiskEngine {
         account.fee_credits = account.fee_credits.saturating_sub(due as i128);
 
         // If fee_credits is negative, pay from capital
+        let mut paid_from_capital = 0u128;
         if account.fee_credits.is_negative() {
             let owed = neg_i128_to_u128(account.fee_credits.get());
             let pay = core::cmp::min(owed, account.capital.get());
@@ -2076,6 +2077,7 @@ impl RiskEngine {
 
             // Credit back what was paid
             account.fee_credits = account.fee_credits.saturating_add(pay as i128);
+            paid_from_capital = pay;
         }
 
         // Check maintenance margin if account has a position (MTM check)
@@ -2087,7 +2089,7 @@ impl RiskEngine {
             }
         }
 
-        Ok(due) // Return fee due for keeper rebate calculation
+        Ok(paid_from_capital) // Return actual amount paid into insurance
     }
 
     /// Best-effort maintenance settle for crank paths.
@@ -2125,6 +2127,7 @@ impl RiskEngine {
         account.fee_credits = account.fee_credits.saturating_sub(due as i128);
 
         // If negative, pay what we can from capital (no margin check)
+        let mut paid_from_capital = 0u128;
         if account.fee_credits.is_negative() {
             let owed = neg_i128_to_u128(account.fee_credits.get());
             let pay = core::cmp::min(owed, account.capital.get());
@@ -2134,9 +2137,27 @@ impl RiskEngine {
             self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
 
             account.fee_credits = account.fee_credits.saturating_add(pay as i128);
+            paid_from_capital = pay;
         }
 
-        Ok(due)
+        Ok(paid_from_capital) // Return actual amount paid into insurance
+    }
+
+    /// Pay down existing fee debt (negative fee_credits) using available capital.
+    /// Does not advance last_fee_slot or charge new fees — just sweeps capital
+    /// that became available (e.g. after warmup settlement) into insurance.
+    fn pay_fee_debt_from_capital(&mut self, idx: u16) {
+        let a = &mut self.accounts[idx as usize];
+        if a.fee_credits.is_negative() && !a.capital.is_zero() {
+            let owed = neg_i128_to_u128(a.fee_credits.get());
+            let pay = core::cmp::min(owed, a.capital.get());
+            if pay > 0 {
+                a.capital = a.capital.saturating_sub(pay);
+                self.insurance_fund.balance = self.insurance_fund.balance + pay;
+                self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
+                a.fee_credits = a.fee_credits.saturating_add(pay as i128);
+            }
+        }
     }
 
     /// Touch account for force-realize paths: settles funding, mark, and fees but
@@ -4229,6 +4250,20 @@ impl RiskEngine {
         // 4. Settle warmup (convert warmed PnL to capital, realize losses)
         self.settle_warmup_to_capital(idx)?;
 
+        // 5. Sweep any fee debt from newly-available capital (warmup may
+        //    have created capital that should pay outstanding fee debt)
+        self.pay_fee_debt_from_capital(idx);
+
+        // 6. Re-check maintenance margin after fee debt sweep
+        if !self.accounts[idx as usize].position_size.is_zero() {
+            if !self.is_above_maintenance_margin_mtm(
+                &self.accounts[idx as usize],
+                oracle_price,
+            ) {
+                return Err(RiskError::Undercollateralized);
+            }
+        }
+
         Ok(())
     }
 
@@ -4356,6 +4391,9 @@ impl RiskEngine {
 
         // Settle warmup after deposit (allows losses to be paid promptly if underwater)
         self.settle_warmup_to_capital(idx)?;
+
+        // If any older fee debt remains, use capital to pay it now.
+        self.pay_fee_debt_from_capital(idx);
 
         Ok(())
     }
@@ -6364,7 +6402,7 @@ mod tests {
     }
 
     #[test]
-    fn test_maintenance_fee_paid_from_fee_credits_counts_as_revenue() {
+    fn test_maintenance_fee_paid_from_fee_credits_is_coupon_not_revenue() {
         let mut params = params_for_tests();
         params.maintenance_fee_per_slot = U128::new(10);
         let mut engine = RiskEngine::new(params);
@@ -6405,7 +6443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_maintenance_fee_splits_between_credits_and_capital_counts_full_revenue() {
+    fn test_maintenance_fee_splits_credits_coupon_capital_to_insurance() {
         let mut params = params_for_tests();
         params.maintenance_fee_per_slot = U128::new(10);
         let mut engine = RiskEngine::new(params);
