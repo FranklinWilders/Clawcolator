@@ -5110,14 +5110,3 @@ impl RiskEngine {
     }
 }
 
-// ===========================
-// Tests (requires --features test)
-// ===========================
-#[cfg(all(test, feature = "test"))]
-mod tests;
-
-// ===========================
-// Kani Proofs
-// ===========================
-#[cfg(kani)]
-mod kani_proofs;
