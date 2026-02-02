@@ -2740,9 +2740,6 @@ impl RiskEngine {
             mul_u128(saturating_abs_i128(exec_size) as u128, exec_price as u128) / 1_000_000;
         let fee = mul_u128(notional, self.params.trading_fee_bps as u128) / 10_000;
 
-        // Pre-compute haircut ratio before split_at_mut borrows accounts
-        let (h_num, h_den) = self.haircut_ratio();
-
         // Access both accounts
         let (user, lp) = if user_idx < lp_idx {
             let (left, right) = self.accounts.split_at_mut(lp_idx as usize);
@@ -2804,7 +2801,33 @@ impl RiskEngine {
             .checked_sub(fee)
             .ok_or(RiskError::InsufficientBalance)?;
 
-        // Inline helper: compute effective positive PnL with pre-computed haircut
+        // Compute projected pnl_pos_tot AFTER trade PnL for fresh haircut in margin checks.
+        // Can't call self.haircut_ratio() due to split_at_mut borrow on accounts;
+        // inline the delta computation and haircut formula.
+        let old_user_pnl_pos = if user.pnl.get() > 0 { user.pnl.get() as u128 } else { 0 };
+        let new_user_pnl_pos = if new_user_pnl > 0 { new_user_pnl as u128 } else { 0 };
+        let old_lp_pnl_pos = if lp.pnl.get() > 0 { lp.pnl.get() as u128 } else { 0 };
+        let new_lp_pnl_pos = if new_lp_pnl > 0 { new_lp_pnl as u128 } else { 0 };
+
+        // Recompute haircut using projected post-trade pnl_pos_tot (spec §3.3).
+        // Fee moves C→I so Residual = V - C_tot - I is unchanged; only pnl_pos_tot changes.
+        let projected_pnl_pos_tot = self.pnl_pos_tot
+            .get()
+            .saturating_add(new_user_pnl_pos)
+            .saturating_sub(old_user_pnl_pos)
+            .saturating_add(new_lp_pnl_pos)
+            .saturating_sub(old_lp_pnl_pos);
+
+        let (h_num, h_den) = if projected_pnl_pos_tot == 0 {
+            (1u128, 1u128)
+        } else {
+            let residual = self.vault.get()
+                .saturating_sub(self.c_tot.get())
+                .saturating_sub(self.insurance_fund.balance.get());
+            (core::cmp::min(residual, projected_pnl_pos_tot), projected_pnl_pos_tot)
+        };
+
+        // Inline helper: compute effective positive PnL with post-trade haircut
         let eff_pos_pnl_inline = |pnl: i128| -> u128 {
             if pnl <= 0 {
                 return 0;
@@ -2867,12 +2890,7 @@ impl RiskEngine {
         // Credit fee to user's fee_credits (active traders earn credits that offset maintenance)
         user.fee_credits = user.fee_credits.saturating_add(fee as i128);
 
-        // Update pnl_pos_tot for both accounts (can't use set_pnl due to split_at_mut borrow)
-        let old_user_pnl_pos = if user.pnl.get() > 0 { user.pnl.get() as u128 } else { 0 };
-        let new_user_pnl_pos = if new_user_pnl > 0 { new_user_pnl as u128 } else { 0 };
-        let old_lp_pnl_pos = if lp.pnl.get() > 0 { lp.pnl.get() as u128 } else { 0 };
-        let new_lp_pnl_pos = if new_lp_pnl > 0 { new_lp_pnl as u128 } else { 0 };
-
+        // (old/new pnl_pos values computed above for projected haircut; reused here)
         user.pnl = I128::new(new_user_pnl);
         user.position_size = I128::new(new_user_position);
         user.entry_price = oracle_price;

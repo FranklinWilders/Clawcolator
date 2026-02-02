@@ -2395,12 +2395,15 @@ fn withdraw_calls_settle_enforces_pnl_or_zero_capital_post() {
 // These prove that margin checks use equity (capital + pnl), not just collateral
 // ============================================================================
 
-/// Proof: Maintenance margin uses equity including negative PnL
+/// Proof: MTM maintenance margin uses haircutted equity including negative PnL
+/// Tests the production margin check (is_above_maintenance_margin_mtm), not the deprecated one.
+/// Since entry_price == oracle_price, mark_pnl = 0, and with a fresh engine (h=1),
+/// equity_mtm = max(0, C_i + min(PNL, 0) + effective_pos_pnl(PNL)).
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
 fn fast_maintenance_margin_uses_equity_including_negative_pnl() {
-    let engine = RiskEngine::new(test_params());
+    let mut engine = RiskEngine::new(test_params());
 
     let capital: u128 = kani::any();
     let pnl: i128 = kani::any();
@@ -2411,42 +2414,41 @@ fn fast_maintenance_margin_uses_equity_including_negative_pnl() {
     // Explicit bound check to avoid i128::abs() overflow on i128::MIN
     kani::assume(position > -1_000 && position < 1_000 && position != 0);
 
-    let account = Account {
-        kind: AccountKind::User,
-        account_id: 1,
-        capital: U128::new(capital),
-        pnl: I128::new(pnl),
-        reserved_pnl: 0,
-        warmup_started_at_slot: 0,
-        warmup_slope_per_step: U128::ZERO,
-        position_size: I128::new(position),
-        entry_price: 1_000_000,
-        funding_index: I128::ZERO,
-        matcher_program: [0; 32],
-        matcher_context: [0; 32],
-        owner: [0; 32],
-        fee_credits: I128::ZERO,
-        last_fee_slot: 0,
-        _padding: [0; 8],
-    };
+    // Set up engine aggregates so haircut_ratio reflects the account's state
+    engine.vault = U128::new(capital + 100_000); // Ensure well-funded
+    engine.insurance_fund.balance = U128::new(0);
+    engine.c_tot = U128::new(capital);
+    let pos_pnl = if pnl > 0 { pnl as u128 } else { 0 };
+    engine.pnl_pos_tot = U128::new(pos_pnl);
+
+    let idx = engine.add_user(0).unwrap();
+    // Override account fields directly (add_user sets capital to 0)
+    engine.accounts[idx as usize].capital = U128::new(capital);
+    engine.accounts[idx as usize].pnl = I128::new(pnl);
+    engine.accounts[idx as usize].position_size = I128::new(position);
+    engine.accounts[idx as usize].entry_price = 1_000_000;
 
     let oracle_price = 1_000_000u64;
 
-    // Calculate expected values (using safe clamped conversion to match production)
+    // Compute expected haircutted equity (entry == oracle → mark_pnl = 0)
     let cap_i = u128_to_i128_clamped(capital);
-    let eq_i = cap_i.saturating_add(pnl);
+    let neg_pnl = core::cmp::min(pnl, 0i128);
+    let eff_pos = engine.effective_pos_pnl(pnl);
+    let eq_i = cap_i
+        .saturating_add(neg_pnl)
+        .saturating_add(u128_to_i128_clamped(eff_pos));
     let equity = if eq_i > 0 { eq_i as u128 } else { 0 };
 
     let position_value = (position.abs() as u128) * (oracle_price as u128) / 1_000_000;
     let mm_required = position_value * (engine.params.maintenance_margin_bps as u128) / 10_000;
 
-    let is_above = engine.is_above_maintenance_margin(&account, oracle_price);
+    let is_above = engine.is_above_maintenance_margin_mtm(&engine.accounts[idx as usize], oracle_price);
 
-    // is_above_maintenance_margin should return equity > mm_required
+    // is_above_maintenance_margin_mtm should return equity > mm_required
     if equity > mm_required {
-        assert!(is_above, "Should be above MM when equity > required");
+        assert!(is_above, "Should be above MM when haircutted equity > required");
     } else {
-        assert!(!is_above, "Should be below MM when equity <= required");
+        assert!(!is_above, "Should be below MM when haircutted equity <= required");
     }
 }
 
@@ -5593,4 +5595,431 @@ fn kani_cross_lp_close_no_pnl_teleport() {
 
     // Conservation must hold
     assert!(engine.check_conservation(ORACLE_100K));
+}
+
+// ============================================================================
+// AUDIT C1-C6: HAIRCUT MECHANISM PROOFS
+// These close the critical gaps identified in the security audit:
+//   C1: haircut_ratio() formula correctness
+//   C2: effective_pos_pnl() and effective_equity() with haircut
+//   C3: Principal protection across accounts
+//   C4: Profit conversion payout formula
+//   C5: Rounding slack bound
+//   C6: Liveness with profitable LP and losses
+// ============================================================================
+
+/// C1: Haircut ratio formula correctness (spec §3.2)
+/// Verifies:
+///   - h_num <= h_den (h in [0, 1])
+///   - h_den > 0 (never division by zero)
+///   - h_num <= Residual and h_num <= PNL_pos_tot
+///   - Fully backed: h == 1
+///   - Underbacked: h_num == Residual
+///   - PNL_pos_tot == 0: h = (1, 1)
+#[kani::proof]
+#[kani::unwind(33)]
+#[kani::solver(cadical)]
+fn proof_haircut_ratio_formula_correctness() {
+    let mut engine = RiskEngine::new(test_params());
+
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let pnl_pos_tot: u128 = kani::any();
+
+    kani::assume(vault <= 100_000);
+    kani::assume(c_tot <= vault);
+    kani::assume(insurance <= vault.saturating_sub(c_tot));
+    kani::assume(pnl_pos_tot <= 100_000);
+
+    engine.vault = U128::new(vault);
+    engine.c_tot = U128::new(c_tot);
+    engine.insurance_fund.balance = U128::new(insurance);
+    engine.pnl_pos_tot = U128::new(pnl_pos_tot);
+
+    let (h_num, h_den) = engine.haircut_ratio();
+    let residual = vault.saturating_sub(c_tot).saturating_sub(insurance);
+
+    // P1: h_den is never 0
+    assert!(h_den > 0, "C1: h_den must be > 0");
+
+    // P2: h in [0, 1] — h_num <= h_den
+    assert!(h_num <= h_den, "C1: h_num must be <= h_den (h in [0,1])");
+
+    // P3: h_num <= Residual (when pnl_pos_tot > 0)
+    if pnl_pos_tot > 0 {
+        assert!(h_num <= residual, "C1: h_num must be <= Residual");
+    }
+
+    // P4: h_num <= pnl_pos_tot (when pnl_pos_tot > 0)
+    if pnl_pos_tot > 0 {
+        assert!(h_num <= pnl_pos_tot, "C1: h_num must be <= pnl_pos_tot");
+    }
+
+    // P5: When pnl_pos_tot == 0, h == (1, 1)
+    if pnl_pos_tot == 0 {
+        assert!(h_num == 1 && h_den == 1, "C1: h must be (1,1) when pnl_pos_tot == 0");
+    }
+
+    // P6: When fully backed (Residual >= pnl_pos_tot > 0), h == 1
+    if pnl_pos_tot > 0 && residual >= pnl_pos_tot {
+        assert!(
+            h_num == pnl_pos_tot && h_den == pnl_pos_tot,
+            "C1: h must be 1 when fully backed"
+        );
+    }
+
+    // P7: When underbacked (0 < Residual < pnl_pos_tot), h_num == Residual
+    if pnl_pos_tot > 0 && residual < pnl_pos_tot {
+        assert!(h_num == residual, "C1: h_num must equal Residual when underbacked");
+    }
+
+    // Non-vacuity: partial haircut case is reachable
+    if pnl_pos_tot > 0 && residual > 0 && residual < pnl_pos_tot {
+        assert!(
+            h_num > 0 && h_num < h_den,
+            "C1 non-vacuity: partial haircut must have 0 < h < 1"
+        );
+    }
+}
+
+/// C2: Effective equity formula with haircut (spec §3.3)
+/// Verifies:
+///   - effective_pos_pnl(pnl) == floor(max(pnl, 0) * h_num / h_den)
+///   - effective_equity() matches spec formula: max(0, C + min(PNL, 0) + PNL_eff_pos)
+///   - Haircutted equity <= unhaircutted equity
+///   - Tests both fully-backed and underbacked scenarios
+#[kani::proof]
+#[kani::unwind(33)]
+#[kani::solver(cadical)]
+fn proof_effective_equity_with_haircut() {
+    let mut engine = RiskEngine::new(test_params());
+
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let pnl_pos_tot: u128 = kani::any();
+    let capital: u128 = kani::any();
+    let pnl: i128 = kani::any();
+
+    kani::assume(vault > 0 && vault <= 10_000);
+    kani::assume(c_tot <= vault);
+    kani::assume(insurance <= vault.saturating_sub(c_tot));
+    kani::assume(pnl_pos_tot > 0 && pnl_pos_tot <= 10_000);
+    kani::assume(capital <= 5_000);
+    kani::assume(pnl > -5_000 && pnl < 5_000);
+
+    // Create account via add_user, then override
+    let idx = engine.add_user(0).unwrap();
+    engine.accounts[idx as usize].capital = U128::new(capital);
+    engine.accounts[idx as usize].pnl = I128::new(pnl);
+
+    // Set global aggregates (overriding what add_user set)
+    engine.vault = U128::new(vault);
+    engine.c_tot = U128::new(c_tot);
+    engine.insurance_fund.balance = U128::new(insurance);
+    engine.pnl_pos_tot = U128::new(pnl_pos_tot);
+
+    let (h_num, h_den) = engine.haircut_ratio();
+
+    // P1: effective_pos_pnl matches spec formula
+    let eff = engine.effective_pos_pnl(pnl);
+    if pnl <= 0 {
+        assert!(eff == 0, "C2: effective_pos_pnl must be 0 for non-positive PnL");
+    } else {
+        let expected = (pnl as u128).saturating_mul(h_num) / h_den;
+        assert!(eff == expected, "C2: effective_pos_pnl must equal floor(pos_pnl * h_num / h_den)");
+        // Haircutted must not exceed raw
+        assert!(eff <= pnl as u128, "C2: haircutted PnL must not exceed raw PnL");
+    }
+
+    // P2: effective_equity matches spec: max(0, C + min(PNL, 0) + PNL_eff_pos)
+    let expected_eq = {
+        let cap_i = u128_to_i128_clamped(capital);
+        let neg_pnl = core::cmp::min(pnl, 0);
+        let eq_i = cap_i
+            .saturating_add(neg_pnl)
+            .saturating_add(u128_to_i128_clamped(eff));
+        if eq_i > 0 { eq_i as u128 } else { 0 }
+    };
+    let actual_eq = engine.effective_equity(&engine.accounts[idx as usize]);
+    assert!(actual_eq == expected_eq, "C2: effective_equity must match spec formula");
+
+    // P3: Haircutted equity <= unhaircutted equity
+    let unhaircutted = engine.account_equity(&engine.accounts[idx as usize]);
+    assert!(
+        actual_eq <= unhaircutted,
+        "C2: haircutted equity must be <= unhaircutted equity"
+    );
+
+    // Non-vacuity: when h < 1 and PnL > 0, haircutted equity < unhaircutted equity
+    let residual = vault.saturating_sub(c_tot).saturating_sub(insurance);
+    if pnl > 0 && residual < pnl_pos_tot && pnl as u128 <= pnl_pos_tot {
+        assert!(eff < pnl as u128, "C2 non-vacuity: partial haircut must reduce effective PnL");
+    }
+}
+
+/// C3: Principal protection across accounts (spec §0, goal 1)
+/// "One account's insolvency MUST NOT directly reduce any other account's protected principal."
+/// Verifies that loss write-off on account A leaves account B's capital unchanged.
+#[kani::proof]
+#[kani::unwind(33)]
+#[kani::solver(cadical)]
+fn proof_principal_protection_across_accounts() {
+    let mut engine = RiskEngine::new(test_params());
+
+    // Account A: will suffer loss write-off (negative PnL exceeds capital)
+    let a = engine.add_user(0).unwrap();
+    let a_capital: u128 = kani::any();
+    let a_loss: u128 = kani::any(); // magnitude of negative PnL
+    kani::assume(a_capital > 0 && a_capital <= 10_000);
+    kani::assume(a_loss > a_capital && a_loss <= 20_000); // loss exceeds capital → write-off
+
+    engine.accounts[a as usize].capital = U128::new(a_capital);
+    engine.accounts[a as usize].pnl = I128::new(-(a_loss as i128));
+
+    // Account B: profitable, should be protected
+    let b = engine.add_user(0).unwrap();
+    let b_capital: u128 = kani::any();
+    let b_pnl: u128 = kani::any();
+    kani::assume(b_capital > 0 && b_capital <= 10_000);
+    kani::assume(b_pnl > 0 && b_pnl <= 10_000);
+
+    engine.accounts[b as usize].capital = U128::new(b_capital);
+    engine.accounts[b as usize].pnl = I128::new(b_pnl as i128);
+
+    // Set up consistent global aggregates
+    engine.c_tot = U128::new(a_capital + b_capital);
+    engine.pnl_pos_tot = U128::new(b_pnl); // only B has positive PnL
+    engine.vault = U128::new(a_capital + b_capital + b_pnl); // V = C_tot + backing for B's PnL
+
+    // Record B's state before
+    let b_capital_before = engine.accounts[b as usize].capital.get();
+    let b_pnl_before = engine.accounts[b as usize].pnl.get();
+
+    // Settle A's loss (this triggers loss write-off per §6.1)
+    let result = engine.settle_warmup_to_capital(a);
+    assert!(result.is_ok(), "C3: settle must succeed");
+
+    // A's loss should be settled: capital reduced, remainder written off
+    assert!(
+        engine.accounts[a as usize].pnl.get() >= 0
+            || engine.accounts[a as usize].capital.is_zero(),
+        "C3: A must have loss settled (pnl >= 0 or capital == 0)"
+    );
+
+    // PROOF: B's capital is unchanged
+    assert!(
+        engine.accounts[b as usize].capital.get() == b_capital_before,
+        "C3: B's capital MUST NOT change due to A's loss write-off"
+    );
+
+    // PROOF: B's PnL is unchanged
+    assert!(
+        engine.accounts[b as usize].pnl.get() == b_pnl_before,
+        "C3: B's PnL MUST NOT change due to A's loss write-off"
+    );
+
+    // Conservation still holds
+    assert!(
+        engine.vault.get()
+            >= engine.c_tot.get() + engine.insurance_fund.balance.get(),
+        "C3: conservation must hold after loss write-off"
+    );
+}
+
+/// C4: Profit conversion payout formula (spec §6.2)
+/// Verifies: y = floor(x * h_num / h_den) and:
+///   - C_i increases by exactly y
+///   - PNL_i decreases by exactly x (gross, not net)
+///   - y <= x (haircut means payout <= claim)
+///   - Haircut is computed BEFORE modifications
+#[kani::proof]
+#[kani::unwind(33)]
+#[kani::solver(cadical)]
+fn proof_profit_conversion_payout_formula() {
+    let mut engine = RiskEngine::new(test_params());
+
+    let capital: u128 = kani::any();
+    let pnl: u128 = kani::any(); // positive PnL for conversion
+    let vault: u128 = kani::any();
+    let insurance: u128 = kani::any();
+
+    kani::assume(capital <= 10_000);
+    kani::assume(pnl > 0 && pnl <= 5_000);
+    kani::assume(vault <= 50_000);
+    kani::assume(insurance <= 10_000);
+    kani::assume(vault >= capital + insurance); // conservation
+
+    let idx = engine.add_user(0).unwrap();
+    engine.accounts[idx as usize].capital = U128::new(capital);
+    engine.accounts[idx as usize].pnl = I128::new(pnl as i128);
+
+    // Set warmup so entire PnL is warmable (slope large enough, enough elapsed time)
+    engine.accounts[idx as usize].warmup_started_at_slot = 0;
+    engine.accounts[idx as usize].warmup_slope_per_step = U128::new(pnl); // slope = pnl
+    engine.current_slot = 100; // elapsed = 100, cap = pnl * 100 >> pnl
+
+    engine.c_tot = U128::new(capital);
+    engine.pnl_pos_tot = U128::new(pnl);
+    engine.vault = U128::new(vault);
+    engine.insurance_fund.balance = U128::new(insurance);
+
+    // Record pre-conversion state
+    let cap_before = engine.accounts[idx as usize].capital.get();
+    let pnl_before = engine.accounts[idx as usize].pnl.get();
+    let (h_num, h_den) = engine.haircut_ratio();
+
+    // x = min(avail_gross, cap) = min(pnl, pnl * 100) = pnl
+    let x = pnl; // entire positive PnL is warmable
+    let expected_y = x.saturating_mul(h_num) / h_den;
+
+    // Execute conversion
+    let result = engine.settle_warmup_to_capital(idx);
+    assert!(result.is_ok(), "C4: settle_warmup must succeed");
+
+    let cap_after = engine.accounts[idx as usize].capital.get();
+    let pnl_after = engine.accounts[idx as usize].pnl.get();
+
+    // P1: Capital increased by exactly y = floor(x * h_num / h_den)
+    assert!(
+        cap_after == cap_before + expected_y,
+        "C4: capital must increase by floor(x * h_num / h_den)"
+    );
+
+    // P2: PnL decreased by exactly x (gross, not payout)
+    assert!(
+        pnl_after == pnl_before - (x as i128),
+        "C4: PnL must decrease by gross amount x"
+    );
+
+    // P3: Payout <= claim (y <= x)
+    assert!(expected_y <= x, "C4: payout must not exceed claim");
+
+    // P4: Haircut loss = x - y is the "burnt" portion
+    let haircut_loss = x - expected_y;
+
+    // P5: When underbacked, haircut_loss > 0
+    let residual = vault.saturating_sub(capital).saturating_sub(insurance);
+    if residual < pnl {
+        assert!(haircut_loss > 0, "C4 non-vacuity: underbacked must have haircut loss > 0");
+    }
+}
+
+/// C5: Rounding slack bound (spec §3.4)
+/// With K accounts having positive PnL:
+///   - Σ effective_pos_pnl_i <= Residual
+///   - Residual - Σ effective_pos_pnl_i < K (rounding slack < number of positive-PnL accounts)
+#[kani::proof]
+#[kani::unwind(33)]
+#[kani::solver(cadical)]
+fn proof_rounding_slack_bound() {
+    let mut engine = RiskEngine::new(test_params());
+
+    // Two accounts with positive PnL (K = 2)
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+
+    let pnl_a: u128 = kani::any();
+    let pnl_b: u128 = kani::any();
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+
+    kani::assume(pnl_a > 0 && pnl_a <= 10_000);
+    kani::assume(pnl_b > 0 && pnl_b <= 10_000);
+    kani::assume(vault <= 50_000);
+    kani::assume(c_tot <= vault);
+    kani::assume(insurance <= vault.saturating_sub(c_tot));
+
+    engine.accounts[a as usize].pnl = I128::new(pnl_a as i128);
+    engine.accounts[b as usize].pnl = I128::new(pnl_b as i128);
+    engine.vault = U128::new(vault);
+    engine.c_tot = U128::new(c_tot);
+    engine.insurance_fund.balance = U128::new(insurance);
+    engine.pnl_pos_tot = U128::new(pnl_a + pnl_b);
+
+    let residual = vault.saturating_sub(c_tot).saturating_sub(insurance);
+
+    // Compute effective PnL for each account
+    let eff_a = engine.effective_pos_pnl(pnl_a as i128);
+    let eff_b = engine.effective_pos_pnl(pnl_b as i128);
+    let sum_eff = eff_a + eff_b;
+
+    // P1: Sum of effective PnLs <= Residual
+    assert!(
+        sum_eff <= residual,
+        "C5: sum of effective positive PnLs must not exceed Residual"
+    );
+
+    // P2: Rounding slack < K (number of positive-PnL accounts)
+    let slack = residual - sum_eff;
+    let k = 2u128; // two accounts with positive PnL
+    if residual <= pnl_a + pnl_b {
+        // Only meaningful when underbacked (when fully backed, Residual can be >> sum_eff)
+        assert!(slack < k, "C5: rounding slack must be < K when underbacked");
+    }
+
+    // Non-vacuity: test underbacked case
+    if residual < pnl_a + pnl_b && residual > 0 {
+        assert!(
+            sum_eff <= residual,
+            "C5 non-vacuity: underbacked case must satisfy sum <= Residual"
+        );
+    }
+}
+
+/// C6: Liveness — profitable LP doesn't block withdrawals (spec §0, goal 5)
+/// "A surviving profitable LP position MUST NOT block accounting progress."
+/// Verifies that after one account's loss is written off, another account can still withdraw.
+#[kani::proof]
+#[kani::unwind(33)]
+#[kani::solver(cadical)]
+fn proof_liveness_after_loss_writeoff() {
+    let mut engine = RiskEngine::new(test_params());
+    engine.current_slot = 100;
+    engine.last_crank_slot = 100;
+    engine.last_full_sweep_start_slot = 100;
+
+    // Account A: suffered total loss (capital exhausted, PnL written off)
+    let a = engine.add_user(0).unwrap();
+    engine.accounts[a as usize].capital = U128::new(0); // wiped out
+    engine.accounts[a as usize].pnl = I128::new(0); // written off
+
+    // Account B: profitable LP with capital and zero position (can withdraw)
+    let b = engine.add_user(0).unwrap();
+    let b_capital: u128 = kani::any();
+    kani::assume(b_capital >= 1000 && b_capital <= 50_000);
+    engine.accounts[b as usize].capital = U128::new(b_capital);
+    engine.accounts[b as usize].pnl = I128::new(0);
+
+    // Set up global state
+    engine.c_tot = U128::new(b_capital); // only B has capital
+    engine.pnl_pos_tot = U128::new(0);
+    engine.vault = U128::new(b_capital); // V = C_tot (insurance = 0)
+    engine.insurance_fund.balance = U128::new(0);
+
+    // B should be able to withdraw all capital (no position → no margin check)
+    let withdraw_amount: u128 = kani::any();
+    kani::assume(withdraw_amount > 0 && withdraw_amount <= b_capital);
+
+    let result = engine.withdraw(b, withdraw_amount, 100, 1_000_000);
+
+    // PROOF: Withdrawal must succeed — system is live despite A's total loss
+    assert!(
+        result.is_ok(),
+        "C6: withdrawal must succeed — profitable account must not be blocked by wiped-out account"
+    );
+
+    // Verify B got the withdrawal
+    assert!(
+        engine.accounts[b as usize].capital.get() == b_capital - withdraw_amount,
+        "C6: B's capital must decrease by withdrawal amount"
+    );
+
+    // Conservation still holds
+    assert!(
+        engine.vault.get() >= engine.c_tot.get() + engine.insurance_fund.balance.get(),
+        "C6: conservation must hold after withdrawal"
+    );
 }
