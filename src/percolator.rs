@@ -1279,17 +1279,19 @@ impl RiskEngine {
         // This converts warmed pnl to capital and realizes negative pnl
         self.touch_account_full(idx, now_slot, oracle_price)?;
 
-        let account = &self.accounts[idx as usize];
-
         // Position must be zero
-        if !account.position_size.is_zero() {
+        if !self.accounts[idx as usize].position_size.is_zero() {
             return Err(RiskError::Undercollateralized); // Has open position
         }
 
-        // Check no outstanding fees owed
-        if account.fee_credits.is_negative() {
-            return Err(RiskError::InsufficientBalance); // Owes fees
+        // Forgive any remaining fee debt (Finding C: fee debt traps).
+        // pay_fee_debt_from_capital (via touch_account_full above) already paid
+        // what it could. Any remainder is uncollectable — forgive and proceed.
+        if self.accounts[idx as usize].fee_credits.is_negative() {
+            self.accounts[idx as usize].fee_credits = I128::ZERO;
         }
+
+        let account = &self.accounts[idx as usize];
 
         // PnL must be zero to close. This enforces:
         // 1. Users can't bypass warmup by closing with positive unwarmed pnl
@@ -2943,8 +2945,14 @@ impl RiskEngine {
         // lp_max_abs: monotone increase only (conservative upper bound)
         self.lp_max_abs = U128::new(self.lp_max_abs.get().max(new_lp_abs));
 
-        // Settle matured warmup using the OLD slope/window before resetting.
-        // This ensures matured value is not lost when the slope gets recomputed.
+        // Two-pass settlement: losses first, then profits.
+        // This ensures the loser's capital reduction increases Residual before
+        // the winner's profit conversion reads the haircut ratio. Without this,
+        // the winner's matured PnL can be haircutted to 0 because Residual
+        // hasn't been increased by the loser's loss settlement yet (Finding G).
+        self.settle_loss_only(user_idx)?;
+        self.settle_loss_only(lp_idx)?;
+        // Now Residual reflects realized losses; profit conversion uses correct h.
         self.settle_warmup_to_capital(user_idx)?;
         self.settle_warmup_to_capital(lp_idx)?;
 
@@ -2954,6 +2962,35 @@ impl RiskEngine {
 
         Ok(())
     }
+    /// Settle loss only (§6.1): negative PnL pays from capital immediately.
+    /// If PnL still negative after capital exhausted, write off via set_pnl(i, 0).
+    /// Used in two-pass settlement to ensure all losses are realized (increasing
+    /// Residual) before any profit conversions use the haircut ratio.
+    pub fn settle_loss_only(&mut self, idx: u16) -> Result<()> {
+        if !self.is_used(idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
+
+        let pnl = self.accounts[idx as usize].pnl.get();
+        if pnl < 0 {
+            let need = neg_i128_to_u128(pnl);
+            let capital = self.accounts[idx as usize].capital.get();
+            let pay = core::cmp::min(need, capital);
+
+            if pay > 0 {
+                self.set_capital(idx as usize, capital - pay);
+                self.set_pnl(idx as usize, pnl.saturating_add(pay as i128));
+            }
+
+            // Write off any remaining negative PnL (spec §6.1 step 4)
+            if self.accounts[idx as usize].pnl.is_negative() {
+                self.set_pnl(idx as usize, 0);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Settle warmup: loss settlement + profit conversion per spec §6
     ///
     /// §6.1 Loss settlement: negative PnL pays from capital immediately.
