@@ -2006,8 +2006,13 @@ impl RiskEngine {
         }
 
         // Charge liquidation fee (from remaining capital → insurance)
+        // Use ceiling division for consistency with trade fees
         let notional = mul_u128(outcome.abs_pos, oracle_price as u128) / 1_000_000;
-        let fee_raw = mul_u128(notional, self.params.liquidation_fee_bps as u128) / 10_000;
+        let fee_raw = if notional > 0 && self.params.liquidation_fee_bps > 0 {
+            (mul_u128(notional, self.params.liquidation_fee_bps as u128) + 9999) / 10_000
+        } else {
+            0
+        };
         let fee = core::cmp::min(fee_raw, self.params.liquidation_fee_cap.get());
         let account_capital = self.accounts[idx as usize].capital.get();
         let pay = core::cmp::min(fee, account_capital);
@@ -2759,10 +2764,15 @@ impl RiskEngine {
         self.settle_maintenance_fee(user_idx, now_slot, oracle_price)?;
         self.settle_maintenance_fee(lp_idx, now_slot, oracle_price)?;
 
-        // Calculate fee
+        // Calculate fee (ceiling division to prevent micro-trade fee evasion)
         let notional =
             mul_u128(saturating_abs_i128(exec_size) as u128, exec_price as u128) / 1_000_000;
-        let fee = mul_u128(notional, self.params.trading_fee_bps as u128) / 10_000;
+        let fee = if notional > 0 && self.params.trading_fee_bps > 0 {
+            // Ceiling division: ensures at least 1 atomic unit fee for any real trade
+            (mul_u128(notional, self.params.trading_fee_bps as u128) + 9999) / 10_000
+        } else {
+            0
+        };
 
         // Access both accounts
         let (user, lp) = if user_idx < lp_idx {

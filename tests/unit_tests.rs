@@ -4127,3 +4127,86 @@ fn test_lp_position_flip_margin_check() {
     assert!(result2.is_ok(), "LP position flip should succeed with sufficient initial margin");
     assert_eq!(engine.accounts[lp_idx as usize].position_size.get(), -1_000_000);
 }
+
+/// Regression test for Finding J: micro-trade fee evasion
+/// Before fix: fee = notional * fee_bps / 10_000 (truncates to 0 for small trades)
+/// After fix: ceiling division ensures at least 1 unit fee for any non-zero trade
+#[test]
+fn test_micro_trade_fee_not_zero() {
+    let mut params = default_params();
+    params.trading_fee_bps = 10; // 0.1% fee
+    params.maintenance_margin_bps = 100; // 1% for easy math
+    params.initial_margin_bps = 100;
+    params.warmup_period_slots = 0;
+    params.max_crank_staleness_slots = u64::MAX;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    // Deposit enough capital for margin
+    engine.deposit(user_idx, 1_000_000_000, 0).unwrap();
+    engine.accounts[lp_idx as usize].capital = U128::new(1_000_000_000);
+    engine.vault += 1_000_000_000;
+    engine.c_tot = U128::new(2_000_000_000);
+
+    let oracle_price = 1_000_000u64; // $1
+
+    let insurance_before = engine.insurance_fund.balance.get();
+
+    // Execute a micro-trade: size=1, price=$1 → notional = 1
+    // Old fee calc: 1 * 10 / 10_000 = 0 (WRONG - fee evasion!)
+    // New fee calc: (1 * 10 + 9999) / 10_000 = 1 (CORRECT - minimum 1 unit)
+    let size: i128 = 1;
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle_price, size).unwrap();
+
+    let insurance_after = engine.insurance_fund.balance.get();
+    let fee_charged = insurance_after - insurance_before;
+
+    // Fee MUST be at least 1 (ceiling division prevents zero-fee micro-trades)
+    assert!(
+        fee_charged >= 1,
+        "Micro-trade must pay at least 1 unit fee (ceiling division). Got fee={}",
+        fee_charged
+    );
+}
+
+/// Test that fee is correctly zero when trading_fee_bps is zero (fee-free mode)
+#[test]
+fn test_zero_fee_bps_means_no_fee() {
+    let mut params = default_params();
+    params.trading_fee_bps = 0; // Fee-free trading
+    params.maintenance_margin_bps = 100;
+    params.initial_margin_bps = 100;
+    params.warmup_period_slots = 0;
+    params.max_crank_staleness_slots = u64::MAX;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(user_idx, 1_000_000_000, 0).unwrap();
+    engine.accounts[lp_idx as usize].capital = U128::new(1_000_000_000);
+    engine.vault += 1_000_000_000;
+    engine.c_tot = U128::new(2_000_000_000);
+
+    let oracle_price = 100_000_000u64; // $100
+
+    let insurance_before = engine.insurance_fund.balance.get();
+
+    // Execute a trade with fee_bps=0
+    let size: i128 = 1_000_000;
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle_price, size).unwrap();
+
+    let insurance_after = engine.insurance_fund.balance.get();
+    let fee_charged = insurance_after - insurance_before;
+
+    // Fee MUST be 0 when trading_fee_bps is 0
+    assert_eq!(
+        fee_charged, 0,
+        "Fee must be zero when trading_fee_bps=0. Got fee={}",
+        fee_charged
+    );
+}

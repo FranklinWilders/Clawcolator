@@ -1,6 +1,6 @@
-# Risk Engine Spec (Source of Truth) — v5 (Fee-Debt-as-Liability + Crank Warmup + Initial Margin + Funding Anti-Retroactivity + Position Flip as Risk-Increasing)
+# Risk Engine Spec (Source of Truth) — v6 (Fee-Debt-as-Liability + Crank Warmup + Initial Margin + Funding Anti-Retroactivity + Position Flip + Fee Ceiling)
 **Design:** **Protected Principal + Junior Profit Claims with Global Haircut Ratio**  
-**Status:** Implementation source-of-truth (normative language: MUST / MUST NOT / SHOULD / MAY)   (updated: fee debt is margin liability; crank advances warmup; risk-increasing trades use initial margin; funding accrual is anti-retroactive; position sign-flips require initial margin)
+**Status:** Implementation source-of-truth (normative language: MUST / MUST NOT / SHOULD / MAY)   (updated: fee debt is margin liability; crank advances warmup; risk-increasing trades use initial margin; funding accrual is anti-retroactive; position sign-flips require initial margin; trade fees use ceiling division)
 **Scope:** Perpetual DEX risk engine for a single quote-token vault (e.g., Solana program-owned vault).  
 
 **Goal:** Achieve the same safety goals as the prior design (oracle manipulation resistance within a warmup window, principal protection, bounded insolvency handling, conservation, and liveness) with **no global ADL scans** and **no “recover stranded” function**, while preventing “PnL zombie” accounts from indefinitely poisoning the global haircut ratio.
@@ -306,6 +306,12 @@ Then margin checks can use `mark = 0` at that oracle.
 
 ### 8.1 Trading fees (senior, paid to insurance)
 Trading fees MUST NOT be socialized via the haircut ratio. They are explicit transfers to insurance.
+
+**Fee calculation (normative):**
+- `fee = ceil(notional * trading_fee_bps / 10_000)`
+- The engine MUST use **ceiling division** to prevent micro-trade fee evasion.
+- If `trading_fee_bps > 0` and `notional > 0`, then `fee ≥ 1` (at least one atomic unit).
+- If `trading_fee_bps == 0`, then `fee = 0` (fee-free mode is allowed).
 
 When charging a fee `fee`:
 - Deduct from payer protected principal (or fee credits, if implemented):
