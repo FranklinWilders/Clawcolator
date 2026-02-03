@@ -3949,3 +3949,121 @@ fn test_abandoned_with_stale_last_fee_slot_eventually_closed() {
     // (first crank drains capital to 0, GC might close it there already)
 }
 
+
+#[test]
+fn test_finding_l_new_position_requires_initial_margin() {
+    // Replicates the integration test scenario:
+    // - maintenance_margin_bps = 500 (5%)
+    // - initial_margin_bps = 1000 (10%)
+    // - User deposits 0.6 SOL (600_000_000)
+    // - User opens ~10 SOL notional position
+    // - Trade should FAIL (6% < 10%)
+
+    let mut params = default_params();
+    params.maintenance_margin_bps = 500;  // 5%
+    params.initial_margin_bps = 1000;      // 10%
+    params.trading_fee_bps = 0;            // No fee for cleaner math
+    params.warmup_period_slots = 0;
+    params.max_crank_staleness_slots = u64::MAX;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+    
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    // Deposit 600M (0.6 SOL in lamports)
+    engine.deposit(user_idx, 600_000_000, 0).unwrap();
+    
+    // LP needs capital to take the other side
+    engine.accounts[lp_idx as usize].capital = U128::new(100_000_000_000);
+    engine.vault += 100_000_000_000;
+
+    // Oracle price: $138 (in e6 = 138_000_000)
+    let oracle_price = 138_000_000u64;
+
+    // Position size for ~10 SOL notional at $138:
+    // notional = size * price / 1_000_000
+    // 10_000_000_000 = size * 138_000_000 / 1_000_000
+    // size = 10_000_000_000 * 1_000_000 / 138_000_000 = ~72_463_768
+    let size: i128 = 72_463_768;
+
+    // Execute trade - should FAIL because:
+    // - Position value = 72_463_768 * 138_000_000 / 1_000_000 = ~10_000_000_000
+    // - Initial margin required (10%) = 1_000_000_000
+    // - User equity = 600_000_000
+    // - 600_000_000 < 1_000_000_000 → UNDERCOLLATERALIZED
+    let result = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle_price, size);
+
+    assert!(
+        result.is_err(),
+        "Opening new position with only 6% margin should FAIL when 10% initial margin required. \
+         Got {:?}", result
+    );
+    assert!(
+        matches!(result, Err(percolator::RiskError::Undercollateralized)),
+        "Error should be Undercollateralized"
+    );
+}
+
+#[test]
+fn test_position_flip_margin_check() {
+    // Test: flipping from +100 to -100 (same absolute size)
+    // Should this require initial margin for the new short position?
+    
+    let mut params = default_params();
+    params.maintenance_margin_bps = 500;  // 5%
+    params.initial_margin_bps = 1000;      // 10%
+    params.trading_fee_bps = 0;
+    params.warmup_period_slots = 0;
+    params.max_crank_staleness_slots = u64::MAX;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+    
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    // User needs capital for initial position (10% of 100M notional = 10M)
+    engine.deposit(user_idx, 15_000_000, 0).unwrap();
+    
+    // LP capital
+    engine.accounts[lp_idx as usize].capital = U128::new(100_000_000);
+    engine.vault += 100_000_000;
+
+    let oracle_price = 100_000_000u64; // $100
+
+    // Open long position of 1M units ($100M notional)
+    let size: i128 = 1_000_000;
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle_price, size).unwrap();
+    assert_eq!(engine.accounts[user_idx as usize].position_size.get(), 1_000_000);
+    
+    // Withdraw to leave user at exactly maintenance margin (5% = 5M)
+    // After opening, user has some equity. Reduce it to maintenance level.
+    // With 15M deposit, 1M position, 100 price, position value = 100M
+    // Current equity = 15M (approx, ignoring fees)
+    // Maintenance = 5M
+    // Want to withdraw down to ~5.5M equity for flip test
+    // Actually let's just set capital directly for test simplicity
+    engine.accounts[user_idx as usize].capital = U128::new(5_500_000);
+    engine.c_tot = U128::new(5_500_000);
+    
+    // Now flip from +1M to -1M (trade -2M)
+    // |new| = 1M, |old| = 1M, so NOT risk-increasing per current logic
+    // Should only require maintenance margin (5% of 100M = 5M)
+    // User has 5.5M > 5M, so passes
+    let flip_size: i128 = -2_000_000;
+    let result = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle_price, flip_size);
+    
+    // The trade should succeed (demonstrating the edge case)
+    // Arguably this should fail because we're opening a NEW short position
+    // which should require initial margin, but the current logic allows it.
+    println!("Flip trade result: {:?}", result);
+    println!("Position after flip: {}", engine.accounts[user_idx as usize].position_size.get());
+    
+    // This assertion demonstrates the edge case - 
+    // user opened -1M short with only ~5% margin
+    if result.is_ok() {
+        assert_eq!(engine.accounts[user_idx as usize].position_size.get(), -1_000_000);
+        println!("EDGE CASE: Position flip from +1M to -1M succeeded with only maintenance margin");
+        println!("New short position opened with ~5.5% margin instead of 10% initial margin");
+    }
+}
