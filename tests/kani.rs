@@ -323,15 +323,13 @@ fn inv_structural(engine: &RiskEngine) -> bool {
 fn inv_accounting(engine: &RiskEngine) -> bool {
     // A1: Primary conservation: vault >= c_tot + insurance
     // This is the fundamental invariant in the haircut system.
-    let c_tot = engine.c_tot.get();
-    let insurance = engine.insurance_fund.balance.get();
-    let vault = engine.vault.get();
-
-    if vault < c_tot.saturating_add(insurance) {
-        return false;
-    }
-
-    true
+    // Equivalent to: signed_residual >= 0 (no bad debt).
+    let residual = RiskEngine::signed_residual(
+        engine.vault.get(),
+        engine.c_tot.get(),
+        engine.insurance_fund.balance.get(),
+    );
+    residual >= 0
 }
 
 /// N1 boundary condition: after settlement boundaries (settle/withdraw/deposit/trade/liquidation),
@@ -341,13 +339,13 @@ fn n1_boundary_holds(account: &percolator::Account) -> bool {
 }
 
 /// Fast conservation check for proofs with no open positions / funding.
-/// vault >= c_tot + insurance
+/// vault >= c_tot + insurance ⟺ signed_residual >= 0 (no bad debt)
 fn conservation_fast_no_funding(engine: &RiskEngine) -> bool {
-    engine.vault.get()
-        >= engine
-            .c_tot
-            .get()
-            .saturating_add(engine.insurance_fund.balance.get())
+    RiskEngine::signed_residual(
+        engine.vault.get(),
+        engine.c_tot.get(),
+        engine.insurance_fund.balance.get(),
+    ) >= 0
 }
 
 /// Mode invariant (placeholder - no mode fields in haircut system)
