@@ -120,3 +120,10 @@ Kani harnesses verify key invariants including conservation, isolation, and no-t
 cargo install --locked kani-verifier
 cargo kani setup
 cargo kani
+```
+
+---
+
+## References
+
+- Tarun Chitra, *Autodeleveraging: Impossibilities and Optimization*, arXiv:2512.01112, 2025. https://arxiv.org/abs/2512.01112
