@@ -1199,11 +1199,28 @@ fn funding_p5_bounded_operations_no_overflow() {
     let result = engine.accrue_funding_with_rate(dt, price, rate);
 
     // Either succeeds or returns Overflow error (never panics)
-    if result.is_err() {
+    if result.is_ok() {
+        // On success: funding index must have changed (unless dt==0 or rate==0)
+        // and the engine must still be in a consistent state
+        if dt > 0 && rate != 0 {
+            assert!(
+                engine.funding_index_qpb_e6.get() != 0 || rate == 0,
+                "funding index must change when dt > 0 and rate != 0"
+            );
+        }
+    } else {
         assert!(
             matches!(result.unwrap_err(), RiskError::Overflow),
             "Only Overflow error allowed"
         );
+    }
+
+    // Non-vacuity: with small bounded inputs, accrual must succeed
+    if dt > 0 && dt < 100 && rate.abs() < 100 && price < 100_000_000 {
+        let mut engine2 = RiskEngine::new(test_params());
+        engine2.last_funding_slot = 0;
+        let r2 = engine2.accrue_funding_with_rate(dt, price, rate);
+        assert!(r2.is_ok(), "non-vacuity: small bounded inputs must succeed");
     }
 }
 
@@ -4835,7 +4852,7 @@ fn proof_trade_pnl_zero_sum() {
 
     // Execute trade at oracle price (exec_price = oracle, so trade_pnl = 0)
     let res = engine.execute_trade(&NoOpMatcher, lp, user, 0, oracle, size as i128);
-    kani::assume(res.is_ok());
+    assert!(res.is_ok(), "non-vacuity: trade must succeed with well-capitalized accounts and bounded inputs");
 
     let user_pnl_after = engine.accounts[user as usize].pnl.get();
     let lp_pnl_after = engine.accounts[lp as usize].pnl.get();
@@ -6030,14 +6047,14 @@ fn proof_gap3_conservation_trade_entry_neq_oracle() {
 
     // Trade 1: open position at oracle_1 (entry_price set to oracle_1)
     let res1 = engine.execute_trade(&NoOpMatcher, lp, user, 100, oracle_1, size);
-    kani::assume(res1.is_ok());
+    assert!(res1.is_ok(), "non-vacuity: open trade must succeed with well-capitalized accounts");
 
     // Non-vacuity: entry_price was set to oracle_1
     let _entry_before = engine.accounts[user as usize].entry_price;
 
     // Trade 2: close at oracle_2 (exercises mark-to-market when entry ≠ oracle)
     let res2 = engine.execute_trade(&NoOpMatcher, lp, user, 100, oracle_2, -size);
-    kani::assume(res2.is_ok());
+    assert!(res2.is_ok(), "non-vacuity: close trade must succeed");
 
     // Non-vacuity: entry_price was ≠ oracle_2 before the second trade
     // (it was oracle_1 from the first trade, and oracle_1 may differ from oracle_2)
@@ -6150,17 +6167,17 @@ fn proof_gap3_multi_step_lifecycle_conservation() {
 
     // Step 2: Open trade at oracle_1
     let trade1 = engine.execute_trade(&NoOpMatcher, lp, user, 0, oracle_1, size);
-    kani::assume(trade1.is_ok());
+    assert!(trade1.is_ok(), "non-vacuity: open trade must succeed");
     kani::assert(canonical_inv(&engine), "INV after open trade");
 
     // Step 3: Crank with funding at oracle_2
     let crank = engine.keeper_crank(user, 50, oracle_2, funding_rate, false);
-    kani::assume(crank.is_ok());
+    assert!(crank.is_ok(), "non-vacuity: crank must succeed");
     kani::assert(canonical_inv(&engine), "INV after crank");
 
     // Step 4: Close trade at oracle_2
     let trade2 = engine.execute_trade(&NoOpMatcher, lp, user, 50, oracle_2, -size);
-    kani::assume(trade2.is_ok());
+    assert!(trade2.is_ok(), "non-vacuity: close trade must succeed");
     kani::assert(canonical_inv(&engine), "INV after close trade");
 
     // Touch both accounts to settle any outstanding funding
