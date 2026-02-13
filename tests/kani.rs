@@ -4302,7 +4302,7 @@ fn proof_settle_warmup_preserves_inv() {
     engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(100);
     engine.recompute_aggregates();
 
-    kani::assume(canonical_inv(&engine));
+    kani::assert(canonical_inv(&engine), "setup state must satisfy INV");
 
     // Snapshot capital + pnl before (for positive pnl, this sum must be preserved)
     let cap_before = engine.accounts[user_idx as usize].capital;
