@@ -475,6 +475,7 @@ macro_rules! assert_err {
         match $result {
             Ok(_) => {
                 kani::assert(false, $msg);
+                unreachable!()
             }
             Err(e) => e,
         }
@@ -1208,7 +1209,7 @@ fn funding_p4_settle_before_position_change() {
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
 fn funding_p5_bounded_operations_no_overflow() {
-    // P5: No overflows on bounded inputs (or returns Overflow error)
+    // P5: No overflows on bounded-safe inputs.
 
     let mut engine = RiskEngine::new(test_params());
 
@@ -1228,20 +1229,17 @@ fn funding_p5_bounded_operations_no_overflow() {
     // Accrue should not panic
     let result = engine.accrue_funding_with_rate(dt, price, rate);
 
-    // Either succeeds or returns Overflow error (never panics)
-    if result.is_ok() {
-        // On success: funding index must have changed (unless dt==0 or rate==0)
-        // and the engine must still be in a consistent state
-        if dt > 0 && rate != 0 {
-            assert!(
-                engine.funding_index_qpb_e6.get() != 0 || rate == 0,
-                "funding index must change when dt > 0 and rate != 0"
-            );
-        }
-    } else {
+    // In this bounded-safe region, accrual must succeed.
+    assert!(
+        result.is_ok(),
+        "bounded accrue_funding_with_rate inputs must succeed"
+    );
+
+    // On success: funding index must have changed (unless dt==0 or rate==0)
+    if dt > 0 && rate != 0 {
         assert!(
-            matches!(result.unwrap_err(), RiskError::Overflow),
-            "Only Overflow error allowed"
+            engine.funding_index_qpb_e6.get() != 0,
+            "funding index must change when dt > 0 and rate != 0"
         );
     }
 
@@ -1252,6 +1250,29 @@ fn funding_p5_bounded_operations_no_overflow() {
         let r2 = engine2.accrue_funding_with_rate(dt, price, rate);
         assert!(r2.is_ok(), "non-vacuity: small bounded inputs must succeed");
     }
+}
+
+#[kani::proof]
+#[kani::unwind(33)]
+#[kani::solver(cadical)]
+fn funding_p5_invalid_bounds_return_overflow() {
+    // Error-path companion proof: invalid bounds must return Overflow.
+    let mut engine = RiskEngine::new(test_params());
+    engine.last_funding_slot = 0;
+
+    let use_bad_rate: bool = kani::any();
+    let result = if use_bad_rate {
+        // Guard in accrue_funding rejects |rate| > 10_000 bps.
+        engine.accrue_funding_with_rate(1, 1_000_000, 10_001)
+    } else {
+        // Guard in accrue_funding rejects dt > 31_536_000.
+        engine.accrue_funding_with_rate(31_536_001, 1_000_000, 1)
+    };
+
+    assert!(
+        matches!(result, Err(RiskError::Overflow)),
+        "invalid bounds must return Overflow"
+    );
 }
 
 #[kani::proof]
