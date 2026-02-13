@@ -7548,8 +7548,9 @@ fn proof_lifecycle_trade_crash_settle_loss_conservation() {
     assert_ok!(trade, "open trade must succeed");
     kani::assert(canonical_inv(&engine), "INV after trade");
 
-    // Step 3: Oracle crashes below entry (concrete for tractability)
-    let oracle_crash: u64 = 700_000;
+    // Step 3: Oracle crashes below entry (finite symbolic choice for tractability)
+    let crash_variant: bool = kani::any();
+    let oracle_crash: u64 = if crash_variant { 700_000 } else { 900_000 };
 
     // Step 4: Crank at crashed oracle — may liquidate user
     let crank = engine.keeper_crank(user, 50, oracle_crash, 0, false);
