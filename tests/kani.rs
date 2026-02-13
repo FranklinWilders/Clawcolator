@@ -6524,9 +6524,10 @@ fn proof_gap5_fee_settle_margin_or_err() {
                 "Undercollateralized error requires open position"
             );
         }
-        Err(_) => {
-            // Other errors (Unauthorized, etc.) are acceptable
-        }
+        Err(_) => kani::assert(
+            false,
+            "unexpected error class from settle_maintenance_fee in this bounded setup"
+        ),
     }
 }
 
