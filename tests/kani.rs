@@ -4267,14 +4267,18 @@ fn proof_liquidate_preserves_inv() {
 
     kani::assume(canonical_inv(&engine));
 
-    let result = engine.liquidate_at_oracle(user_idx, 100, oracle_price);
-
-    if result.is_ok() {
-        kani::assert(
-            canonical_inv(&engine),
-            "INV must hold after liquidate_at_oracle",
-        );
-    }
+    let liquidated = assert_ok!(
+        engine.liquidate_at_oracle(user_idx, 100, oracle_price),
+        "liquidate_at_oracle must succeed on clearly undercollateralized setup"
+    );
+    kani::assert(
+        liquidated,
+        "liquidation should trigger in this deterministic undercollateralized scenario"
+    );
+    kani::assert(
+        canonical_inv(&engine),
+        "INV must hold after liquidate_at_oracle",
+    );
 }
 
 
