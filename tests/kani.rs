@@ -4072,7 +4072,7 @@ fn proof_deposit_preserves_inv() {
 
     let cap_before = engine.accounts[user_idx as usize].capital;
 
-    kani::assume(canonical_inv(&engine));
+    kani::assert(canonical_inv(&engine), "setup state must satisfy INV");
 
     let amount: u128 = kani::any();
     kani::assume(amount > 0 && amount < 100_000);
