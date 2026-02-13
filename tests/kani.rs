@@ -7648,3 +7648,77 @@ fn proof_lifecycle_trade_warmup_withdraw_topup_conservation() {
         "Conservation must hold at end of full lifecycle",
     );
 }
+
+/// Alternate lifecycle scenario with a larger favorable oracle move.
+///
+/// Keeps the same sequence as proof_lifecycle_trade_warmup_withdraw_topup_conservation
+/// but uses oracle_2 = 1_150_000 to cover a distinct profit magnitude while
+/// preserving solver tractability.
+#[kani::proof]
+#[kani::unwind(5)] // MAX_ACCOUNTS=4
+#[kani::solver(cadical)]
+fn proof_lifecycle_trade_warmup_withdraw_topup_conservation_alt_oracle() {
+    let mut engine = RiskEngine::new(test_params());
+    engine.vault = U128::new(100_000);
+    engine.insurance_fund.balance = U128::new(10_000);
+    engine.current_slot = 0;
+    engine.last_crank_slot = 0;
+    engine.last_full_sweep_start_slot = 0;
+
+    let user = engine.add_user(0).unwrap();
+    let lp = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
+
+    // Step 1: Deposits
+    assert_ok!(engine.deposit(user, 50_000, 0), "user deposit");
+    assert_ok!(engine.deposit(lp, 200_000, 0), "LP deposit");
+
+    // Step 2: User goes long at $1.00
+    let trade = engine.execute_trade(&NoOpMatcher, lp, user, 10, 1_000_000, 100);
+    assert_ok!(trade, "open trade");
+    kani::assert(canonical_inv(&engine), "INV after trade");
+
+    // Step 3: Larger oracle move up (alternate scenario)
+    let oracle_2: u64 = 1_150_000;
+
+    // Step 4: Crank at new oracle
+    let crank = engine.keeper_crank(user, 50, oracle_2, 0, false);
+    let _ = assert_ok!(crank, "keeper_crank must succeed on bounded profitable state");
+    kani::assert(canonical_inv(&engine), "INV after crank");
+
+    // Step 5: Close position to lock in profit
+    let close = engine.execute_trade(&NoOpMatcher, lp, user, 50, oracle_2, -100);
+    let _ = assert_ok!(close, "close trade must succeed after profitable move");
+    kani::assert(canonical_inv(&engine), "INV after close");
+
+    // Step 6: Time passes for warmup (slot 50 → 200, warmup_period=100)
+    engine.current_slot = 200;
+    engine.last_crank_slot = 200;
+    engine.last_full_sweep_start_slot = 200;
+
+    // Step 7: Settle warmup — converts warmed PnL to capital with haircut
+    let settle = engine.settle_warmup_to_capital(user);
+    let _ = assert_ok!(settle, "settle_warmup_to_capital must succeed");
+    kani::assert(
+        canonical_inv(&engine),
+        "INV must hold after settle_warmup on real profit",
+    );
+
+    // Step 8: Withdraw some capital
+    let withdraw_amt: u128 = 5_000;
+    let w = engine.withdraw(user, withdraw_amt, 200, oracle_2);
+    let _ = assert_ok!(w, "withdraw must succeed after close + warmup settle");
+    kani::assert(canonical_inv(&engine), "INV after withdraw");
+
+    // Step 9: Top up insurance
+    let topup_amt: u128 = 10_000;
+    let t = engine.top_up_insurance_fund(topup_amt);
+    let _ = assert_ok!(t, "top_up_insurance_fund must succeed with bounded amount");
+    kani::assert(
+        canonical_inv(&engine),
+        "INV must hold after top_up_insurance on traded state",
+    );
+    kani::assert(
+        conservation_fast_no_funding(&engine),
+        "Conservation must hold at end of full lifecycle",
+    );
+}
