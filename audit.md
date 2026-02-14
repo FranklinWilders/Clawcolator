@@ -3,10 +3,10 @@ Generated: 2026-02-13
 
 ## Summary
 
-- **Total Proofs**: 145
-- **Passed**: 145 (100%)
+- **Total Proofs**: 151
+- **Passed**: 151 (100%)
 - **Failed**: 0
-- **Total verification time**: ~79 min (sequential, one-by-one)
+- **Total verification time**: ~80 min (sequential, one-by-one)
 
 ---
 
@@ -462,6 +462,47 @@ Three rounds of proof hardening addressed vacuity risks, naming correctness, and
 
 ---
 
+## External Review Rebuttal Proofs (2026-02-14)
+
+Added 6 new Kani proofs to formally verify that 3 claimed critical flaws from an external review are NOT exploitable. No production code changes — all modifications in `tests/kani.rs`.
+
+| Flaw | Claim | Verdict | Proofs |
+|------|-------|---------|--------|
+| 1. Debt Wipe | Free option after writeoff | **Not exploitable** — writeoff requires flat position | 2 |
+| 2. Phantom Margin | Stale entry inflates equity | **Not exploitable** — mark settled before all checks | 2 |
+| 3. Forever Warmup | Perpetual timer reset traps profit | **Not exploitable** — slope grows proportionally | 2 |
+
+### Flaw 1: "Free Option" Debt Wipe (2 proofs)
+
+| Proof | Time | What it verifies |
+|-------|------|-----------------|
+| proof_flaw1_debt_writeoff_requires_flat_position | 2s | After liquidation with debt writeoff, position is always zero (no free option) |
+| proof_flaw1_gc_never_writes_off_with_open_position | 1s | GC dust predicate blocks PnL writeoff when position_size != 0 |
+
+### Flaw 2: "Phantom Margin Equity" (2 proofs)
+
+| Proof | Time | What it verifies |
+|-------|------|-----------------|
+| proof_flaw2_no_phantom_equity_after_mark_settlement | 35s | After mark settlement, entry==oracle, mark_pnl==0, equity unchanged (symbolic PnL) |
+| proof_flaw2_withdraw_settles_before_margin_check | 4s | withdraw() settles stale entry (entry!=oracle) to oracle before margin check |
+
+### Flaw 3: "Forever Warmup" Reset (2 proofs)
+
+| Proof | Time | What it verifies |
+|-------|------|-----------------|
+| proof_flaw3_warmup_reset_increases_slope_proportionally | 1s | Increased PnL yields non-decreasing warmup slope (symbolic PnL pair) |
+| proof_flaw3_warmup_converts_after_single_slot | 3s | Warmup converts PnL to capital after 1 slot; liveness proven (symbolic PnL) |
+
+### Completeness Concerns (no new proofs needed)
+
+1. **`I_floor` unused**: Governance parameter, used in `execute_trade()`, tested by existing proof.
+2. **Dust routing to insurance**: By design — writeoff reduces Residual. Proven by `proof_gc_dust_preserves_inv`.
+3. **U256 overflow in mul_u128**: Widening multiplication, verified by `proof_gap4_trade_extreme_*`.
+
+Proof count: 145 → 151.
+
+---
+
 ## Aggregate Maintenance Proofs (2026-02-12)
 
 Added 8 new Kani proofs for O(1) aggregate helpers (`set_pnl`, `set_capital`) and related invariants.
@@ -482,9 +523,9 @@ Proof count: 125 → 133.
 
 ---
 
-## Full Timing Results (2026-02-13)
+## Full Timing Results (2026-02-14)
 
-145/145 proofs pass. No timeouts, no failures.
+151/151 proofs pass. No timeouts, no failures.
 
 | Proof Name | Time | Status |
 |------------|------|--------|
@@ -633,6 +674,16 @@ Proof count: 125 → 133.
 | withdrawal_rejects_if_below_initial_margin_at_oracle | 3s | PASS |
 | withdrawal_requires_sufficient_balance | 3s | PASS |
 | zero_pnl_withdrawable_is_zero | 2s | PASS |
+| proof_flaw1_debt_writeoff_requires_flat_position | 2s | PASS |
+| proof_flaw1_gc_never_writes_off_with_open_position | 1s | PASS |
+| proof_flaw2_no_phantom_equity_after_mark_settlement | 35s | PASS |
+| proof_flaw2_withdraw_settles_before_margin_check | 4s | PASS |
+| proof_flaw3_warmup_reset_increases_slope_proportionally | 1s | PASS |
+| proof_flaw3_warmup_converts_after_single_slot | 3s | PASS |
+
+## Historical Results (2026-02-13)
+
+Previous results: 145 proofs, 145 passed, 0 failures.
 
 ## Historical Results (2026-02-12)
 
