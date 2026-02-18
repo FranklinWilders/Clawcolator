@@ -4154,7 +4154,7 @@ fn proof_add_user_structural_integrity() {
     engine.deposit(first, deposit_amt, 0).unwrap();
     engine.close_account(first, 100, 1_000_000).unwrap();
 
-    kani::assert(inv_structural(&engine), "structural INV after close");
+    kani::assert(canonical_inv(&engine), "canonical INV after close");
 
     let pop_before = engine.num_used_accounts;
     let free_head_before = engine.free_head;
@@ -4174,8 +4174,8 @@ fn proof_add_user_structural_integrity() {
         "add_user must advance free_head",
     );
     kani::assert(
-        inv_structural(&engine),
-        "add_user must preserve structural invariant",
+        canonical_inv(&engine),
+        "add_user must preserve canonical invariant",
     );
     // Recycled slot
     kani::assert(idx == first, "freelist must recycle freed slot");
@@ -4201,7 +4201,7 @@ fn proof_close_account_structural_integrity() {
 
     let pop_before = engine.num_used_accounts;
 
-    kani::assert(inv_structural(&engine), "structural INV before close");
+    kani::assert(canonical_inv(&engine), "canonical INV before close");
 
     let _withdrawn = assert_ok!(
         engine.close_account(user_idx, 100, 1_000_000),
@@ -4221,8 +4221,8 @@ fn proof_close_account_structural_integrity() {
         "close_account must return index to freelist head",
     );
     kani::assert(
-        inv_structural(&engine),
-        "close_account must preserve structural invariant",
+        canonical_inv(&engine),
+        "close_account must preserve canonical invariant",
     );
 }
 
@@ -4547,11 +4547,11 @@ fn proof_gc_dust_structural_integrity() {
     engine.vault = U128::new(live_capital);
     sync_engine_aggregates(&mut engine);
 
-    kani::assert(inv_structural(&engine), "structural INV before GC");
+    kani::assert(canonical_inv(&engine), "canonical INV before GC");
 
     engine.garbage_collect_dust();
 
-    kani::assert(inv_structural(&engine), "GC must preserve structural invariant");
+    kani::assert(canonical_inv(&engine), "GC must preserve canonical invariant");
     kani::assert(engine.is_used(live_idx as usize), "live account survives GC");
 }
 
