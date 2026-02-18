@@ -1660,10 +1660,10 @@ fn fast_frame_update_warmup_slope_only_mutates_one_account() {
 
 // ============================================================================
 // FAST Validity-Preservation Proofs
-// These prove that valid_state is preserved by operations
+// These prove that canonical_inv is preserved by operations
 // ============================================================================
 
-/// Validity preserved by deposit
+/// canonical_inv preserved by deposit
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
@@ -1674,16 +1674,16 @@ fn fast_valid_preserved_by_deposit() {
     let amount: u128 = kani::any();
     kani::assume(amount > 0 && amount < 10_000);
 
-    kani::assume(valid_state(&engine));
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     let res = engine.deposit(user_idx, amount, 0);
 
     // Non-vacuity: deposit must succeed
-    assert!(res.is_ok(), "non-vacuity: deposit must succeed");
-    assert!(valid_state(&engine), "valid_state preserved by deposit");
+    kani::assert(res.is_ok(), "non-vacuity: deposit must succeed");
+    kani::assert(canonical_inv(&engine), "INV preserved by deposit");
 }
 
-/// Validity preserved by withdraw
+/// canonical_inv preserved by withdraw
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
@@ -1699,16 +1699,16 @@ fn fast_valid_preserved_by_withdraw() {
 
     engine.deposit(user_idx, deposit, 0).unwrap();
 
-    kani::assume(valid_state(&engine));
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     let res = engine.withdraw(user_idx, withdraw, 0, 1_000_000);
 
     // Non-vacuity: withdraw must succeed (no position, withdraw <= deposit)
-    assert!(res.is_ok(), "non-vacuity: withdraw must succeed");
-    assert!(valid_state(&engine), "valid_state preserved by withdraw");
+    kani::assert(res.is_ok(), "non-vacuity: withdraw must succeed");
+    kani::assert(canonical_inv(&engine), "INV preserved by withdraw");
 }
 
-/// Validity preserved by execute_trade
+/// canonical_inv preserved by execute_trade
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
@@ -1727,20 +1727,17 @@ fn fast_valid_preserved_by_execute_trade() {
     kani::assume(delta != i128::MIN);
     kani::assume(delta.abs() < 100);
 
-    kani::assume(valid_state(&engine));
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     let matcher = NoOpMatcher;
     let res = engine.execute_trade(&matcher, lp_idx, user_idx, 0, 1_000_000, delta);
 
     // Non-vacuity: trade must succeed with well-capitalized accounts and small delta
-    assert!(res.is_ok(), "non-vacuity: execute_trade must succeed");
-    assert!(
-        valid_state(&engine),
-        "valid_state preserved by execute_trade"
-    );
+    kani::assert(res.is_ok(), "non-vacuity: execute_trade must succeed");
+    kani::assert(canonical_inv(&engine), "INV preserved by execute_trade");
 }
 
-/// Validity preserved by settle_warmup_to_capital
+/// canonical_inv preserved by settle_warmup_to_capital
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
@@ -1773,19 +1770,19 @@ fn fast_valid_preserved_by_settle_warmup_to_capital() {
     }
     sync_engine_aggregates(&mut engine);
 
-    kani::assume(valid_state(&engine));
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     let res = engine.settle_warmup_to_capital(user_idx);
 
     // Non-vacuity: settle_warmup must succeed (account is used, bounded inputs)
-    assert!(res.is_ok(), "non-vacuity: settle_warmup must succeed");
-    assert!(
-        valid_state(&engine),
-        "valid_state preserved by settle_warmup_to_capital"
+    kani::assert(res.is_ok(), "non-vacuity: settle_warmup must succeed");
+    kani::assert(
+        canonical_inv(&engine),
+        "INV preserved by settle_warmup_to_capital",
     );
 }
 
-/// Validity preserved by top_up_insurance_fund
+/// canonical_inv preserved by top_up_insurance_fund
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
@@ -1795,16 +1792,13 @@ fn fast_valid_preserved_by_top_up_insurance_fund() {
     let amount: u128 = kani::any();
     kani::assume(amount > 0 && amount < 10_000);
 
-    kani::assume(valid_state(&engine));
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     let res = engine.top_up_insurance_fund(amount);
 
     // Non-vacuity: top_up must succeed
-    assert!(res.is_ok(), "non-vacuity: top_up_insurance_fund must succeed");
-    assert!(
-        valid_state(&engine),
-        "valid_state preserved by top_up_insurance_fund"
-    );
+    kani::assert(res.is_ok(), "non-vacuity: top_up_insurance_fund must succeed");
+    kani::assert(canonical_inv(&engine), "INV preserved by top_up_insurance_fund");
 }
 
 // ============================================================================
@@ -3565,7 +3559,7 @@ fn gc_never_frees_account_with_positive_value() {
     );
 }
 
-/// Validity preserved by garbage_collect_dust
+/// canonical_inv preserved by garbage_collect_dust
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
@@ -3585,18 +3579,15 @@ fn fast_valid_preserved_by_garbage_collect_dust() {
     engine.accounts[dust_idx as usize].reserved_pnl = 0;
     engine.accounts[dust_idx as usize].pnl = I128::new(0);
 
-    kani::assume(valid_state(&engine));
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     // Run GC
     let closed = engine.garbage_collect_dust();
 
     // Non-vacuous: GC should actually close the dust account
-    assert!(closed > 0, "GC should close the dust account");
+    kani::assert(closed > 0, "GC should close the dust account");
 
-    assert!(
-        valid_state(&engine),
-        "valid_state preserved by garbage_collect_dust"
-    );
+    kani::assert(canonical_inv(&engine), "INV preserved by garbage_collect_dust");
 }
 
 /// GC never frees accounts that don't satisfy the dust predicate
@@ -6903,7 +6894,7 @@ fn proof_set_pnl_maintains_pnl_pos_tot() {
     engine.set_pnl(user as usize, initial_pnl);
 
     // Verify initial invariant holds
-    assert!(inv_aggregates(&engine), "invariant must hold after initial set_pnl");
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     // Now change pnl to a new value
     let new_pnl: i128 = kani::any();
@@ -6913,8 +6904,8 @@ fn proof_set_pnl_maintains_pnl_pos_tot() {
 
     // Invariant must still hold
     kani::assert(
-        inv_aggregates(&engine),
-        "set_pnl must maintain pnl_pos_tot invariant"
+        canonical_inv(&engine),
+        "set_pnl must maintain canonical_inv"
     );
 }
 
@@ -6933,7 +6924,7 @@ fn proof_set_capital_maintains_c_tot() {
     engine.vault = U128::new(initial_cap + 1000); // Ensure vault covers
 
     // Verify initial invariant
-    assert!(inv_aggregates(&engine), "invariant must hold after initial set_capital");
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     // Change capital
     let new_cap: u128 = kani::any();
@@ -6943,8 +6934,8 @@ fn proof_set_capital_maintains_c_tot() {
     engine.set_capital(user as usize, new_cap);
 
     kani::assert(
-        inv_aggregates(&engine),
-        "set_capital must maintain c_tot invariant"
+        canonical_inv(&engine),
+        "set_capital must maintain canonical_inv"
     );
 }
 
@@ -6973,8 +6964,8 @@ fn proof_force_close_with_set_pnl_preserves_invariant() {
     engine.accounts[user as usize].entry_price = entry_price;
     sync_engine_aggregates(&mut engine);
 
-    // Precondition: invariant holds before force-close
-    kani::assume(inv_aggregates(&engine));
+    // Precondition: canonical_inv holds before force-close
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     // Simulate force-close (CORRECT way - using set_pnl)
     let settle = settlement_price as i128;
@@ -6993,11 +6984,10 @@ fn proof_force_close_with_set_pnl_preserves_invariant() {
     // We want to verify that set_pnl ALONE maintains pnl_pos_tot.
     engine.total_open_interest = U128::new(0);
 
-    // Postcondition: invariant still holds
-    // If set_pnl didn't maintain pnl_pos_tot, this would FAIL
+    // Postcondition: canonical_inv still holds
     kani::assert(
-        inv_aggregates(&engine),
-        "force-close using set_pnl must preserve aggregate invariant"
+        canonical_inv(&engine),
+        "force-close using set_pnl must preserve canonical_inv"
     );
 }
 
@@ -7023,7 +7013,7 @@ fn proof_multiple_force_close_preserves_invariant() {
     engine.accounts[user2 as usize].entry_price = 1_000_000;
     sync_engine_aggregates(&mut engine);
 
-    kani::assume(inv_aggregates(&engine));
+    kani::assert(canonical_inv(&engine), "setup must satisfy INV");
 
     let settlement_price: u64 = kani::any();
     kani::assume(settlement_price > 0 && settlement_price < 2_000_000);
@@ -7046,8 +7036,8 @@ fn proof_multiple_force_close_preserves_invariant() {
     engine.total_open_interest = U128::new(0);
 
     kani::assert(
-        inv_aggregates(&engine),
-        "multiple force-close operations must preserve invariant"
+        canonical_inv(&engine),
+        "multiple force-close operations must preserve canonical_inv"
     );
 }
 
