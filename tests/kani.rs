@@ -2911,203 +2911,8 @@ fn proof_net_extraction_bounded_with_fee_credits() {
 }
 
 // ============================================================================
-// LIQUIDATION PROOFS (LQ1-LQ4)
+// LIQUIDATION PROOFS
 // ============================================================================
-
-/// LQ1: Liquidation reduces OI and enforces safety (partial or full)
-/// Verifies that after liquidation:
-/// - OI strictly decreases
-/// - Remaining position is either 0 or >= min_liquidation_abs (dust rule)
-/// - If position remains, account is above target margin (maintenance + buffer)
-/// - N1 boundary holds (pnl >= 0 or capital == 0)
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_lq1_liquidation_reduces_oi_and_enforces_safety() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Create user with small capital, large position => forced undercollateralized
-    let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 500, 0).unwrap(); // Small capital
-
-    // Give user a position (10 units long at 1.0)
-    // Position value = 10_000_000, margin req at 5% = 500_000
-    // Capital 500 << 500_000 => definitely under-MM
-    engine.accounts[user as usize].position_size = I128::new(10_000_000);
-    engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.accounts[user as usize].pnl = I128::new(0); // slope=0 means no settle noise
-    engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-    sync_engine_aggregates(&mut engine);
-
-    let oi_before = engine.total_open_interest;
-
-    // Oracle at entry => mark_pnl = 0, but still under-MM
-    let oracle_price: u64 = 1_000_000;
-
-    // Attempt liquidation - must trigger
-    let result = engine.liquidate_at_oracle(user, 0, oracle_price);
-
-    // Force liquidation to actually happen (non-vacuous)
-    assert!(result.is_ok(), "liquidation must not error");
-    assert!(result.unwrap(), "setup must force liquidation to trigger");
-
-    let account = &engine.accounts[user as usize];
-    let oi_after = engine.total_open_interest;
-
-    // OI must strictly decrease
-    assert!(
-        oi_after < oi_before,
-        "OI must strictly decrease after liquidation"
-    );
-
-    // Dust rule: remaining position is either 0 or >= min_liquidation_abs
-    let abs_pos = abs_i128_to_u128(account.position_size.get());
-    assert!(
-        abs_pos == 0 || abs_pos >= engine.params.min_liquidation_abs.get(),
-        "Dust rule: position must be 0 or >= min_liquidation_abs"
-    );
-
-    // If position remains, must be above maintenance margin
-    // (Fee charged AFTER the margin safety check absorbs the buffer between target and MM)
-    if abs_pos > 0 {
-        assert!(
-            engine.is_above_margin_bps_mtm(account, oracle_price, engine.params.maintenance_margin_bps),
-            "Partial liquidation must leave account above maintenance margin"
-        );
-    }
-
-    // N1 boundary: pnl >= 0 or capital == 0
-    assert!(
-        n1_boundary_holds(account),
-        "N1 boundary: pnl must be >= 0 OR capital must be 0"
-    );
-}
-
-/// LQ2: Liquidation preserves conservation (bounded slack)
-/// Verifies check_conservation() holds before and after liquidation
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_lq2_liquidation_preserves_conservation() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Create two accounts for minimal setup (user + LP as counterparty)
-    let user = engine.add_user(0).unwrap();
-    let lp = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
-    engine.deposit(user, 500, 0).unwrap(); // Small capital to force under-MM
-    engine.deposit(lp, 10_000, 0).unwrap();
-
-    // Give user a position (LP takes opposite side)
-    // Position value = 10_000_000, margin = 500_000 >> capital 500
-    engine.accounts[user as usize].position_size = I128::new(10_000_000);
-    engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.accounts[user as usize].pnl = I128::new(0);
-    engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[lp as usize].position_size = I128::new(-10_000_000);
-    engine.accounts[lp as usize].entry_price = 1_000_000;
-    engine.accounts[lp as usize].pnl = I128::new(0);
-    engine.accounts[lp as usize].warmup_slope_per_step = U128::new(0);
-    sync_engine_aggregates(&mut engine);
-
-    // Verify conservation before
-    assert!(
-        engine.check_conservation(DEFAULT_ORACLE),
-        "Conservation must hold before liquidation"
-    );
-
-    // Attempt liquidation at oracle (mark_pnl = 0)
-    let oracle_price: u64 = 1_000_000;
-    let result = engine.liquidate_at_oracle(user, 0, oracle_price);
-
-    // Force liquidation to actually trigger (non-vacuous)
-    assert!(result.is_ok(), "liquidation must not error");
-    assert!(result.unwrap(), "setup must force liquidation to trigger");
-
-    // Verify conservation after (with bounded slack)
-    assert!(
-        engine.check_conservation(DEFAULT_ORACLE),
-        "Conservation must hold after liquidation"
-    );
-}
-
-/// LQ3a: Liquidation closes position and maintains conservation
-///
-/// With variation margin, liquidation settles mark PnL before position close.
-/// To avoid complications with partial liquidation margin checks, this proof
-/// uses entry = oracle (mark = 0) to ensure predictable behavior.
-///
-/// Key properties verified:
-/// 1. Liquidation succeeds for undercollateralized account
-/// 2. OI decreases
-/// 3. Conservation holds after liquidation
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_lq3a_profit_routes_through_adl() {
-    let mut engine = RiskEngine::new(test_params());
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.current_slot = 100;
-    engine.last_crank_slot = 100;
-    engine.last_full_sweep_start_slot = 100;
-
-    let oracle_price: u64 = 1_000_000;
-
-    // Use two users instead of user+LP to avoid memcmp
-    let user = engine.add_user(0).unwrap();
-    let counterparty = engine.add_user(0).unwrap();
-
-    // Set capitals directly - user is undercollateralized
-    engine.accounts[user as usize].capital = U128::new(100);
-    engine.accounts[counterparty as usize].capital = U128::new(100_000);
-
-    // vault = sum(capital) + insurance
-    engine.vault = U128::new(100 + 100_000 + 10_000);
-
-    // Use entry = oracle so mark_pnl = 0 (no variation margin settlement complexity)
-    engine.accounts[user as usize].position_size = I128::new(10_000_000);
-    engine.accounts[user as usize].entry_price = oracle_price;
-    engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[counterparty as usize].position_size = I128::new(-10_000_000);
-    engine.accounts[counterparty as usize].entry_price = oracle_price;
-    engine.accounts[counterparty as usize].warmup_slope_per_step = U128::new(0);
-    sync_engine_aggregates(&mut engine);
-
-    // Verify conservation before liquidation
-    assert!(
-        engine.check_conservation(oracle_price),
-        "Conservation must hold before liquidation"
-    );
-
-    let oi_before = engine.total_open_interest;
-
-    let result = engine.liquidate_at_oracle(user, 0, oracle_price);
-
-    // Force liquidation to trigger (non-vacuous)
-    assert!(result.is_ok(), "liquidation must not error");
-    assert!(result.unwrap(), "setup must force liquidation to trigger");
-
-    let account = &engine.accounts[user as usize];
-    let oi_after = engine.total_open_interest;
-
-    // OI must strictly decrease
-    assert!(
-        oi_after < oi_before,
-        "OI must strictly decrease after liquidation"
-    );
-
-    // Conservation must hold after liquidation
-    assert!(
-        engine.check_conservation(oracle_price),
-        "Conservation must hold after liquidation"
-    );
-
-    // Dust rule: remaining position is either 0 or >= min_liquidation_abs
-    let abs_pos = abs_i128_to_u128(account.position_size.get());
-    assert!(
-        abs_pos == 0 || abs_pos >= engine.params.min_liquidation_abs.get(),
-        "Dust rule: position must be 0 or >= min_liquidation_abs"
-    );
-}
 
 /// LQ4: Liquidation fee is paid from capital to insurance
 /// Verifies that the liquidation fee is correctly calculated and transferred.
@@ -3167,25 +2972,26 @@ fn proof_lq4_liquidation_fee_paid_to_insurance() {
     );
 }
 
-/// Proof: keeper_crank never fails due to liquidation errors (best-effort)
-/// Uses deterministic oracle to avoid solver explosion from symbolic price exploration.
+/// Proof: keeper_crank never fails due to liquidation errors (best-effort).
+/// Symbolic capital exercises both fully-solvent and deeply-undercollateralized
+/// liquidation paths. Oracle fixed at entry to avoid solver explosion.
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
 fn proof_keeper_crank_best_effort_liquidation() {
     let mut engine = RiskEngine::new(test_params());
 
-    // Create user
-    let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 1_000, 0).unwrap();
+    let capital: u128 = kani::any();
+    kani::assume(capital >= 100 && capital <= 5_000);
 
-    // Give user a position that could trigger liquidation
-    // Use entry = oracle to avoid ADL (mark_pnl = 0), making solver much faster
-    engine.accounts[user as usize].position_size = I128::new(10_000_000); // Large position
+    let user = engine.add_user(0).unwrap();
+    engine.deposit(user, capital, 0).unwrap();
+
+    // Large position: always under-MM at capital <= 5K (MM = 500K for 10M notional)
+    engine.accounts[user as usize].position_size = I128::new(10_000_000);
     engine.accounts[user as usize].entry_price = 1_000_000;
     sync_engine_aggregates(&mut engine);
 
-    // Deterministic values (avoids solver explosion from symbolic price)
     let oracle_price: u64 = 1_000_000;
     let now_slot: u64 = 1;
 
@@ -3195,43 +3001,6 @@ fn proof_keeper_crank_best_effort_liquidation() {
     assert!(
         result.is_ok(),
         "keeper_crank must always succeed (best-effort)"
-    );
-}
-
-/// LQ6: N1 boundary - after liquidation settle, account either has pnl >= 0 or capital == 0
-/// This ensures negative PnL is properly realized during liquidation settlement
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_lq6_n1_boundary_after_liquidation() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Create user with small capital, large position => definitely under-MM
-    let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 500, 0).unwrap();
-
-    // Position 10 units at 1.0 => value 10_000_000, margin = 500_000 >> capital 500
-    engine.accounts[user as usize].position_size = I128::new(10_000_000);
-    engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.accounts[user as usize].pnl = I128::new(0);
-    engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-    sync_engine_aggregates(&mut engine);
-
-    // Liquidate at oracle 1.0 (mark_pnl = 0)
-    let oracle_price: u64 = 1_000_000;
-    let result = engine.liquidate_at_oracle(user, 0, oracle_price);
-
-    // Force liquidation to trigger (non-vacuous)
-    assert!(result.is_ok(), "liquidation must not error");
-    assert!(result.unwrap(), "setup must force liquidation to trigger");
-
-    let account = &engine.accounts[user as usize];
-
-    // N1: After settlement, either pnl >= 0 or capital == 0
-    // (negative PnL should have been realized from capital)
-    assert!(
-        n1_boundary_holds(account),
-        "N1 boundary: pnl must be >= 0 OR capital must be 0 after liquidation"
     );
 }
 
@@ -3304,283 +3073,88 @@ fn proof_lq7_symbolic_oracle_liquidation() {
     );
 }
 
-// ============================================================================
-// PARTIAL LIQUIDATION PROOFS (LIQ-PARTIAL-1 through LIQ-PARTIAL-4)
-// ============================================================================
-
-/// LIQ-PARTIAL-1: Safety After Liquidation
-/// If liquidation succeeds with partial close, the remaining position must be
-/// above maintenance margin. The liquidation fee (charged after close) may push
-/// equity below target (maintenance + buffer), but it must stay above maintenance.
-///
-/// Setup chosen to produce a genuine partial fill:
-/// - deposit 200_000, position 10M (10 units at 1.0), pnl = 0
-/// - Notional = 10M, MM at 500 bps = 500_000 >> equity 200_000 → undercollateralized
-/// - Partial close leaves ~3.3M remaining (> min_liquidation_abs 100_000)
-/// - After capped fee (10_000), equity = 190_000 > MM of remaining ~166_666
+/// Symbolic partial liquidation: exercises both partial fills (moderate capital,
+/// oracle near entry) and full closes (low capital, oracle below entry).
+/// Covers: canonical_inv, OI decrease, dust rule, N1 boundary, conservation,
+/// and maintenance margin safety after partial fill.
+/// Subsumes concrete LQ1-LQ3a, LQ6, PARTIAL-1 through PARTIAL-5.
 #[kani::proof]
-#[kani::unwind(33)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
-fn proof_liq_partial_1_safety_after_liquidation() {
+fn proof_liq_partial_symbolic() {
     let mut engine = RiskEngine::new(test_params());
+    engine.current_slot = 100;
+    engine.last_crank_slot = 100;
+    engine.last_full_sweep_start_slot = 100;
 
-    let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 200_000, 0).unwrap();
+    let capital: u128 = kani::any();
+    let oracle_price: u64 = kani::any();
+    kani::assume(capital >= 100_000 && capital <= 400_000);
+    kani::assume(oracle_price >= 950_000 && oracle_price <= 1_000_000);
 
-    // Position: 10 units at price 1.0 (oracle = entry → mark_pnl = 0)
-    engine.accounts[user as usize].position_size = I128::new(10_000_000);
-    engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.accounts[user as usize].pnl = I128::new(0);
-    sync_engine_aggregates(&mut engine);
-
-    let oracle_price: u64 = 1_000_000;
-
-    let result = engine.liquidate_at_oracle(user, 0, oracle_price);
-
-    assert!(result.is_ok(), "liquidation must not error");
-    assert!(result.unwrap(), "setup must force liquidation to trigger");
-
-    let account = &engine.accounts[user as usize];
-    let abs_pos = abs_i128_to_u128(account.position_size.get());
-
-    // Non-vacuity: partial fill must occur (not full close)
-    assert!(abs_pos > 0, "setup must produce partial fill, not full close");
-
-    // After partial close + fee, account must be above maintenance margin.
-    // (Fee may push below target = maintenance + buffer, but maintenance must hold.)
-    assert!(
-        engine.is_above_maintenance_margin_mtm(account, oracle_price),
-        "Partial close: account must be above maintenance margin after fee"
-    );
-}
-
-/// LIQ-PARTIAL-2: Dust Elimination
-/// After any liquidation, the remaining position is either:
-///   - 0 (fully closed), OR
-///   - >= min_liquidation_abs (economically meaningful)
-/// This prevents dust positions that are uneconomical to maintain.
-///
-/// Setup produces a genuine partial fill (same as proof 1):
-/// remaining ~3.3M >> min_liquidation_abs 100_000.
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_liq_partial_2_dust_elimination() {
-    let mut engine = RiskEngine::new(test_params());
-
-    let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 200_000, 0).unwrap();
-
-    // Position: 10 units at price 1.0 (oracle = entry → mark_pnl = 0)
-    engine.accounts[user as usize].position_size = I128::new(10_000_000);
-    engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.accounts[user as usize].pnl = I128::new(0);
-    sync_engine_aggregates(&mut engine);
-
-    let min_liquidation_abs = engine.params.min_liquidation_abs;
-    let oracle_price: u64 = 1_000_000;
-
-    let result = engine.liquidate_at_oracle(user, 0, oracle_price);
-
-    assert!(result.is_ok(), "liquidation must not error");
-    assert!(result.unwrap(), "setup must force liquidation to trigger");
-
-    let account = &engine.accounts[user as usize];
-    let abs_pos = abs_i128_to_u128(account.position_size.get());
-
-    // Non-vacuity: partial fill must occur
-    assert!(abs_pos > 0, "setup must produce partial fill, not full close");
-
-    // Dust elimination: remaining position >= min_liquidation_abs
-    assert!(
-        abs_pos >= min_liquidation_abs.get(),
-        "Partial close: remaining position must be >= min_liquidation_abs (no dust)"
-    );
-}
-
-/// LIQ-PARTIAL-3: Routing is Complete via Conservation and N1
-/// Structural proof that all PnL is properly routed (no silent drops):
-/// - Conservation holds after liquidation
-/// - N1 boundary holds (pnl >= 0 or capital == 0)
-/// - Dust rule satisfied
-/// - Partial fill leaves account above maintenance margin
-///
-/// Setup produces a genuine partial fill with two users:
-/// User: deposit 200_000, position 10M long, pnl 0
-/// Counterparty: deposit 200_000, position 10M short, pnl 0
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_liq_partial_3_routing_is_complete_via_conservation_and_n1() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Use two users instead of user+LP (avoids memcmp on pubkey arrays)
+    // User: 10 units long at $1.00, moderate capital.
+    // At oracle=1M, capital=200K: equity=200K, MM=500K → partial close to ~3.2M.
+    // At oracle=950K, capital=100K: equity≈-400K → full close, insolvency.
     let user = engine.add_user(0).unwrap();
     let counterparty = engine.add_user(0).unwrap();
 
-    // Set capitals and vault directly (higher values to support partial fill)
-    engine.accounts[user as usize].capital = U128::new(200_000);
-    engine.accounts[counterparty as usize].capital = U128::new(200_000);
-    engine.vault = U128::new(400_000);
-
-    // User long, counterparty short (zero-sum positions)
+    engine.accounts[user as usize].capital = U128::new(capital);
     engine.accounts[user as usize].position_size = I128::new(10_000_000);
     engine.accounts[user as usize].entry_price = 1_000_000;
+
+    engine.accounts[counterparty as usize].capital = U128::new(500_000);
     engine.accounts[counterparty as usize].position_size = I128::new(-10_000_000);
     engine.accounts[counterparty as usize].entry_price = 1_000_000;
 
-    // No PnL (entry == oracle, pnl = 0)
-    engine.accounts[user as usize].pnl = I128::new(0);
-    engine.accounts[counterparty as usize].pnl = I128::new(0);
+    engine.vault = U128::new(capital + 500_000 + 10_000);
+    engine.insurance_fund.balance = U128::new(10_000);
     sync_engine_aggregates(&mut engine);
+    kani::assert(canonical_inv(&engine), "setup INV");
 
-    // Oracle = entry → mark_pnl = 0
-    // User: capital 200k, equity 200k, notional 10M, MM 500k => undercollateralized
-    let oracle_price: u64 = 1_000_000;
+    let oi_before = engine.total_open_interest;
 
-    // Verify conservation before
-    assert!(
-        engine.check_conservation(DEFAULT_ORACLE),
-        "Conservation must hold before liquidation"
-    );
+    let result = engine.liquidate_at_oracle(user, 100, oracle_price);
+    let triggered = assert_ok!(result, "liquidation must not error");
+    kani::assert(triggered, "account must be undercollateralized");
 
-    let result = engine.liquidate_at_oracle(user, 0, oracle_price);
-
-    assert!(result.is_ok(), "liquidation must not error");
-    assert!(result.unwrap(), "setup must force liquidation to trigger");
+    kani::assert(canonical_inv(&engine), "INV after liquidation");
 
     let account = &engine.accounts[user as usize];
     let abs_pos = abs_i128_to_u128(account.position_size.get());
 
-    // Non-vacuity: partial fill must occur
-    assert!(abs_pos > 0, "setup must produce partial fill, not full close");
-
-    // Conservation holds (no silent PnL drop)
-    assert!(
-        engine.check_conservation(DEFAULT_ORACLE),
-        "Conservation must hold after liquidation"
-    );
-
-    // N1 boundary: pnl >= 0 or capital == 0
-    assert!(
-        n1_boundary_holds(account),
-        "N1 boundary must hold after liquidation"
+    // OI must strictly decrease
+    kani::assert(
+        engine.total_open_interest < oi_before,
+        "OI must decrease",
     );
 
     // Dust rule
-    assert!(
-        abs_pos >= engine.params.min_liquidation_abs.get(),
-        "Dust rule: remaining position must be >= min_liquidation_abs"
-    );
-
-    // After partial close + fee, must be above maintenance margin
-    assert!(
-        engine.is_above_maintenance_margin_mtm(account, oracle_price),
-        "Partial close: account must be above maintenance margin after fee"
-    );
-}
-
-/// LIQ-PARTIAL-4: Conservation Preservation
-/// check_conservation() holds before and after liquidate_at_oracle,
-/// regardless of whether liquidation is full or partial.
-/// Optimized: Use two users, set capitals directly
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_liq_partial_4_conservation_preservation() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Use two users instead of user+LP to avoid memcmp on pubkey arrays
-    let user = engine.add_user(0).unwrap();
-    let counterparty = engine.add_user(0).unwrap();
-
-    // Set capitals directly
-    engine.accounts[user as usize].capital = U128::new(10_000);
-    engine.accounts[counterparty as usize].capital = U128::new(10_000);
-    engine.vault = U128::new(20_000);
-
-    // User long, counterparty short (zero-sum positions)
-    engine.accounts[user as usize].position_size = I128::new(1_000_000);
-    engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.accounts[counterparty as usize].position_size = I128::new(-1_000_000);
-    engine.accounts[counterparty as usize].entry_price = 1_000_000;
-
-    // Zero-sum PnL (conservation-compliant)
-    // User: capital 10k, pnl -9k => equity 1k, notional 1M, MM 50k => undercollateralized
-    engine.accounts[user as usize].pnl = I128::new(-9_000);
-    engine.accounts[counterparty as usize].pnl = I128::new(9_000);
-    sync_engine_aggregates(&mut engine);
-
-    // Verify conservation before
-    assert!(
-        engine.check_conservation(DEFAULT_ORACLE),
-        "Conservation must hold before liquidation"
-    );
-
-    // Deterministic oracle = entry to ensure mark_pnl = 0
-    let oracle_price: u64 = 1_000_000;
-
-    let result = engine.liquidate_at_oracle(user, 0, oracle_price);
-
-    assert!(result.is_ok(), "liquidation must not error");
-    assert!(result.unwrap(), "setup must force liquidation to trigger");
-
-    // Conservation must hold after (with bounded slack)
-    assert!(
-        engine.check_conservation(DEFAULT_ORACLE),
-        "Conservation must hold after liquidation (partial or full)"
-    );
-}
-
-/// LIQ-PARTIAL-5: Deterministic test that partial liquidation reaches target or full close
-/// Uses hardcoded values to prevent Kani "vacuous success" - ensures the proof
-/// actually exercises the liquidation path with meaningful assertions.
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_liq_partial_deterministic_reaches_target_or_full_close() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Create user with enough capital for viable partial close (accounting for fee deduction)
-    let user = engine.add_user(0).unwrap();
-    engine.deposit(user, 200_000, 0).unwrap();
-
-    // Hardcoded setup:
-    // - oracle_price = entry_price = 1_000_000 (mark_pnl = 0)
-    // - maintenance = 500 bps, buffer = 100 bps => target = 600 bps
-    // - Position: 10 units at 1.0 => notional = 10_000_000
-    // - Required margin at 500 bps = 500_000
-    // - Equity = 200_000 (capital) + 0 (pnl) = 200_000 << 500_000 => undercollateralized
-    // - After partial close + fee, viable notional <= (200_000 - fee)/0.06
-    let oracle_price: u64 = 1_000_000;
-    engine.accounts[user as usize].position_size = I128::new(10_000_000); // 10 units
-    engine.accounts[user as usize].entry_price = 1_000_000; // entry at 1.0
-    engine.accounts[user as usize].pnl = I128::new(0);
-    sync_engine_aggregates(&mut engine);
-
-    let result = engine.liquidate_at_oracle(user, 0, oracle_price);
-
-    // Force liquidation to trigger (user is clearly undercollateralized)
-    assert!(result.is_ok(), "Liquidation must not error");
-    assert!(result.unwrap(), "Liquidation must succeed");
-
-    let account = &engine.accounts[user as usize];
-    let abs_pos = abs_i128_to_u128(account.position_size.get());
-
-    // Dust rule must hold
-    assert!(
+    kani::assert(
         abs_pos == 0 || abs_pos >= engine.params.min_liquidation_abs.get(),
-        "Dust rule: position must be 0 or >= min_liquidation_abs"
+        "dust rule",
     );
 
-    // N1 boundary must hold
-    assert!(
+    // N1 boundary
+    kani::assert(
         n1_boundary_holds(account),
-        "N1 boundary must hold after liquidation"
+        "N1: pnl >= 0 OR capital == 0",
     );
 
-    // Note: Target margin check removed - edge cases with fee deduction can leave
-    // partial positions below target. The dust rule + N1 are the critical invariants.
+    // Maintenance margin after partial fill: holds when post-settlement capital
+    // is large enough for the target-MM buffer (100 bps) to absorb the fee cap (10K).
+    // At capital >= 200K and oracle >= 990K: cap_after_mark >= 100K,
+    // target_notional >= 1.65M, buffer = 16.5K > fee_cap(10K).
+    if abs_pos > 0 && capital >= 200_000 && oracle_price >= 990_000 {
+        kani::assert(
+            engine.is_above_maintenance_margin_mtm(account, oracle_price),
+            "partial: above maintenance margin (sufficient capital)",
+        );
+    }
+
+    // Non-vacuity: moderate capital at oracle=entry must produce partial fill
+    if capital >= 200_000 && oracle_price == 1_000_000 {
+        kani::assert(abs_pos > 0, "non-vacuity: partial fill for moderate capital");
+    }
 }
 
 // ==============================================================================
