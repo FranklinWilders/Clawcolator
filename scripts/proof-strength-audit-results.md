@@ -1,6 +1,6 @@
 # Kani Proof Strength Audit Results
 
-Generated: 2026-02-18 (post-strengthening re-audit)
+Generated: 2026-02-18 (final strengthening pass)
 
 146 proof harnesses across `/home/anatoly/percolator/tests/kani.rs`.
 
@@ -10,13 +10,13 @@ Generated: 2026-02-18 (post-strengthening re-audit)
 
 | Classification | Count | Description |
 |---|---|---|
-| STRONG | 122 | Symbolic inputs exercise key branches, canonical_inv or appropriate invariant, non-vacuous |
+| STRONG | 139 | Symbolic inputs exercise key branches, canonical_inv or appropriate invariant, non-vacuous |
 | WEAK | 0 | — |
-| UNIT TEST | 24 | Concrete inputs, single execution path (intentional regression/boundary/negative tests) |
+| UNIT TEST | 7 | Intentional: 3 base cases, 1 stdlib test, 1 meta-test, 1 error-path guard, 1 regression |
 | VACUOUS | 0 | All proofs have non-vacuity assertions or are trivially reachable |
 
 Previous audit: 94 STRONG, 23 WEAK, 30 UNIT TEST across 147 proofs.
-Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_oracle).
+Delta: +45 STRONG, −23 WEAK, −23 UNIT TEST, −1 proof (merged lifecycle alt_oracle).
 
 ---
 
@@ -43,7 +43,7 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 | `withdrawal_requires_sufficient_balance` | 883 | **STRONG** | Symbolic principal/withdraw; canonical_inv pre+post |
 | `pnl_withdrawal_requires_warmup` | 917 | **STRONG** | Symbolic pnl/withdraw; canonical_inv pre+post |
 | `saturating_arithmetic_prevents_overflow` | 961 | **UNIT TEST** | Tests stdlib, not percolator |
-| `zero_pnl_withdrawable_is_zero` | 984 | **UNIT TEST** | Concrete pnl=0, slot=1000 |
+| `zero_pnl_withdrawable_is_zero` | 984 | **STRONG** | Symbolic slot+reserved_pnl; pnl=0 always yields 0 |
 | `negative_pnl_withdrawable_is_zero` | 999 | **STRONG** | Symbolic negative pnl |
 
 ### Funding Properties (P1-P5)
@@ -55,7 +55,7 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 | `funding_p3_bounded_drift` | 1103 | **STRONG** | Symbolic position [10K], delta [10K] |
 | `funding_p4_settle_before_position_change` | 1155 | **STRONG** | Symbolic pos, delta1, delta2, new_pos |
 | `funding_p5_bounded_operations_no_overflow` | 1231 | **STRONG** | Symbolic price, rate, dt |
-| `funding_p5_invalid_bounds_return_overflow` | 1278 | **STRONG** | Symbolic bool selects 2 error paths |
+| `funding_p5_invalid_bounds_return_overflow` | 1278 | **UNIT TEST** | Symbolic bool selects 2 concrete error paths |
 | `funding_zero_position_no_change` | 1301 | **STRONG** | Symbolic pnl, funding_delta |
 
 ### Warmup Slope
@@ -132,7 +132,7 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 | `proof_close_account_includes_warmed_pnl` | 2705 | **STRONG** | Symbolic capital+pnl; full warmup lifecycle |
 | `proof_close_account_negative_pnl_written_off` | 2758 | **STRONG** | Symbolic loss |
 | `proof_set_risk_reduction_threshold_updates` | 2792 | **STRONG** | Symbolic threshold |
-| `proof_trading_credits_fee_to_user` | 2815 | **UNIT TEST** | Concrete trade/oracle/fee; canonical_inv |
+| `proof_trading_credits_fee_to_user` | 2815 | **STRONG** | Symbolic size [100,5M]; ceiling-div fee formula; canonical_inv |
 
 ### Net Extraction
 
@@ -144,7 +144,7 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 
 | Proof | Line | Class | Key Inputs |
 |---|---|---|---|
-| `proof_lq4_liquidation_fee_paid_to_insurance` | 3009 | **UNIT TEST** | Concrete fee; LP counterparty; canonical_inv |
+| `proof_lq4_liquidation_fee_paid_to_insurance` | 3009 | **STRONG** | Symbolic capital [50K,200K]; fee cap verified; canonical_inv |
 | `proof_keeper_crank_best_effort_liquidation` | 3067 | **STRONG** | Symbolic capital+oracle; canonical_inv |
 | `proof_lq7_symbolic_oracle_liquidation` | 3113 | **STRONG** | Symbolic capital+oracle; canonical_inv, OI, dust, N1 |
 | `proof_liq_partial_symbolic` | 3182 | **STRONG** | Symbolic capital+oracle; partial+full close; MM guarded |
@@ -164,7 +164,7 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 | Proof | Line | Class | Key Inputs |
 |---|---|---|---|
 | `withdrawal_maintains_margin_above_maintenance` | 3572 | **STRONG** | 5 symbolic inputs; MTM equity, mark_pnl |
-| `withdrawal_rejects_if_below_initial_margin_at_oracle` | 3636 | **UNIT TEST** | Concrete regression (Bug 5) |
+| `withdrawal_rejects_if_below_initial_margin_at_oracle` | 3636 | **STRONG** | Symbolic capital [5K,20K]+withdraw; both accept+reject paths |
 
 ### Engine INV Preservation
 
@@ -178,7 +178,7 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 | `proof_execute_trade_margin_enforcement` | 3876 | **STRONG** | Symbolic capital [500,2K] near boundary; delta [-15K,15K] |
 | `proof_deposit_preserves_inv` | 3946 | **STRONG** | Symbolic capital/pnl/amount/slot; maintenance fees |
 | `proof_withdraw_preserves_inv` | 3997 | **STRONG** | Symbolic capital/amount/oracle; position+LP |
-| `proof_add_user_structural_integrity` | 4052 | **UNIT TEST** | Concrete freelist recycling cycle |
+| `proof_add_user_structural_integrity` | 4052 | **STRONG** | Symbolic deposit_amt+fee; freelist recycling; inv_structural |
 | `proof_close_account_structural_integrity` | 4090 | **STRONG** | Symbolic deposit; inv_structural; popcount |
 | `proof_liquidate_preserves_inv` | 4145 | **STRONG** | Symbolic capital+oracle; both triggered/not paths |
 | `proof_settle_warmup_preserves_inv` | 4208 | **STRONG** | 8 symbolic inputs; all §6.2 branches; canonical_inv |
@@ -204,8 +204,8 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 |---|---|---|---|
 | `proof_variation_margin_no_pnl_teleport` | 4808 | **STRONG** | Symbolic open/close price + size |
 | `proof_trade_pnl_zero_sum` | 4902 | **STRONG** | Symbolic oracle+size; exact zero-sum |
-| `kani_no_teleport_cross_lp_close` | 4979 | **UNIT TEST** | Concrete regression |
-| `kani_rejects_invalid_matcher_output` | 5091 | **UNIT TEST** | Concrete negative test |
+| `kani_no_teleport_cross_lp_close` | 4979 | **STRONG** | Symbolic oracle [500K,2M]+size [1K,10M]; conservation+zero-sum |
+| `kani_rejects_invalid_matcher_output` | 5091 | **STRONG** | Symbolic oracle+size; BadMatcherOppositeSign rejected |
 | `kani_cross_lp_close_no_pnl_teleport` | 5190 | **UNIT TEST** | Concrete cross-LP regression |
 
 ### Haircut / Effective Equity
@@ -228,17 +228,17 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 
 | Proof | Line | Class | Key Inputs |
 |---|---|---|---|
-| `proof_gap1_touch_account_err_no_mutation` | 5822 | **UNIT TEST** | Concrete overflow; 9-field snapshot unchanged |
-| `proof_gap1_settle_mark_err_no_mutation` | 5869 | **UNIT TEST** | Concrete PnL overflow; mutation-freedom |
+| `proof_gap1_touch_account_err_no_mutation` | 5822 | **STRONG** | Symbolic position+capital+delta; overflow range; snapshot unchanged |
+| `proof_gap1_settle_mark_err_no_mutation` | 5869 | **STRONG** | Symbolic position+capital+pnl_offset; overflow; mutation-freedom |
 | `proof_gap1_crank_with_fees_preserves_inv` | 5918 | **STRONG** | Symbolic fee_credits+crank_slot; canonical_inv+conservation |
 
 ### Gap 2: Matcher Trust Boundary
 
 | Proof | Line | Class | Key Inputs |
 |---|---|---|---|
-| `proof_gap2_rejects_overfill_matcher` | 5972 | **UNIT TEST** | Concrete overfill rejection |
-| `proof_gap2_rejects_zero_price_matcher` | 5997 | **UNIT TEST** | Concrete zero-price rejection |
-| `proof_gap2_rejects_max_price_exceeded_matcher` | 6022 | **UNIT TEST** | Concrete max-price rejection |
+| `proof_gap2_rejects_overfill_matcher` | 5972 | **STRONG** | Symbolic oracle+size; OverfillMatcher always rejected |
+| `proof_gap2_rejects_zero_price_matcher` | 5997 | **STRONG** | Symbolic oracle+size; ZeroPriceMatcher always rejected |
+| `proof_gap2_rejects_max_price_exceeded_matcher` | 6022 | **STRONG** | Symbolic oracle+size; MaxPricePlusOneMatcher always rejected |
 | `proof_gap2_execute_trade_err_preserves_inv` | 6050 | **STRONG** | Symbolic capital/size; canonical_inv on Err path |
 
 ### Gap 3: Multi-Step Conservation
@@ -253,10 +253,10 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 
 | Proof | Line | Class | Key Inputs |
 |---|---|---|---|
-| `proof_gap4_trade_extreme_price_no_panic` | 6285 | **UNIT TEST** | 3 concrete boundary prices |
-| `proof_gap4_trade_extreme_size_no_panic` | 6349 | **UNIT TEST** | 3 concrete boundary sizes |
+| `proof_gap4_trade_extreme_price_no_panic` | 6285 | **STRONG** | Symbolic oracle [1,MAX_ORACLE_PRICE]; canonical_inv |
+| `proof_gap4_trade_extreme_size_no_panic` | 6349 | **STRONG** | Symbolic size [1,MAX_POSITION_ABS]; canonical_inv |
 | `proof_gap4_trade_partial_fill_diff_price_no_panic` | 6410 | **STRONG** | Symbolic oracle+size; non-zero trade PnL |
-| `proof_gap4_margin_extreme_values_no_panic` | 6448 | **UNIT TEST** | Concrete extreme values |
+| `proof_gap4_margin_extreme_values_no_panic` | 6448 | **STRONG** | Symbolic pos/capital/pnl/oracle; full valid ranges |
 
 ### Gap 5: Fee Credits
 
@@ -264,7 +264,7 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 |---|---|---|---|
 | `proof_gap5_fee_settle_margin_or_err` | 6503 | **STRONG** | 4 symbolic; both Ok+Err branches |
 | `proof_gap5_fee_credits_trade_then_settle_bounded` | 6579 | **STRONG** | 3 symbolic; deterministic fee arithmetic |
-| `proof_gap5_fee_credits_saturating_near_max` | 6653 | **UNIT TEST** | Concrete near-i128::MAX |
+| `proof_gap5_fee_credits_saturating_near_max` | 6653 | **STRONG** | Symbolic offset [1,10K] from i128::MAX; no wrap; canonical_inv |
 | `proof_gap5_deposit_fee_credits_conservation` | 6698 | **STRONG** | Symbolic capital+amount; canonical_inv pre+post |
 
 ### Set PnL / Capital Aggregate Proofs
@@ -316,8 +316,8 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 
 | Proof | Line | Class | Key Inputs |
 |---|---|---|---|
-| `proof_flaw1_debt_writeoff_requires_flat_position` | 7746 | **UNIT TEST** | Concrete rebuttal scenario |
-| `proof_flaw1_gc_never_writes_off_with_open_position` | 7803 | **UNIT TEST** | Concrete rebuttal scenario |
+| `proof_flaw1_debt_writeoff_requires_flat_position` | 7746 | **STRONG** | Symbolic capital [100,5K]+loss; liquidation forces flat position |
+| `proof_flaw1_gc_never_writes_off_with_open_position` | 7803 | **STRONG** | Symbolic neg_pnl+position; GC cannot touch open position |
 | `proof_flaw2_no_phantom_equity_after_mark_settlement` | 7850 | **STRONG** | Symbolic position/oracle/pnl; canonical_inv |
 | `proof_flaw2_withdraw_settles_before_margin_check` | 7923 | **STRONG** | Symbolic oracle+withdraw; canonical_inv; stale entry |
 | `proof_flaw3_warmup_reset_increases_slope_proportionally` | 7995 | **STRONG** | Symbolic pnl1+pnl2; slope monotonicity |
@@ -325,36 +325,19 @@ Delta: +28 STRONG, −23 WEAK, −6 UNIT TEST, −1 proof (merged lifecycle alt_
 
 ---
 
-## UNIT TEST Proofs (24)
+## UNIT TEST Proofs (7)
 
-These are intentional concrete tests: regression tests, boundary/extreme value tests, negative tests, and trivial base cases.
+These are intentional: base cases, meta-tests, and tests that cannot meaningfully benefit from symbolic inputs.
 
 | Proof | Reason |
 |---|---|
-| `saturating_arithmetic_prevents_overflow` | Tests stdlib, not percolator |
-| `zero_pnl_withdrawable_is_zero` | Trivial boundary test |
-| `proof_total_open_interest_initial` | Trivial base case |
-| `proof_trading_credits_fee_to_user` | Concrete fee arithmetic |
-| `proof_lq4_liquidation_fee_paid_to_insurance` | Concrete fee arithmetic |
-| `withdrawal_rejects_if_below_initial_margin_at_oracle` | Concrete Bug 5 regression |
-| `proof_inv_holds_for_new_engine` | Constructor base case |
-| `proof_add_user_structural_integrity` | Concrete freelist cycle |
-| `kani_no_teleport_cross_lp_close` | Concrete regression |
-| `kani_rejects_invalid_matcher_output` | Concrete negative test |
-| `kani_cross_lp_close_no_pnl_teleport` | Concrete cross-LP regression |
-| `proof_gap1_touch_account_err_no_mutation` | Concrete overflow error path |
-| `proof_gap1_settle_mark_err_no_mutation` | Concrete overflow error path |
-| `proof_gap2_rejects_overfill_matcher` | Concrete overfill rejection |
-| `proof_gap2_rejects_zero_price_matcher` | Concrete zero-price rejection |
-| `proof_gap2_rejects_max_price_exceeded_matcher` | Concrete max-price rejection |
-| `proof_gap4_trade_extreme_price_no_panic` | 3 concrete boundary prices |
-| `proof_gap4_trade_extreme_size_no_panic` | 3 concrete boundary sizes |
-| `proof_gap4_margin_extreme_values_no_panic` | Concrete extreme values |
-| `proof_gap5_fee_credits_saturating_near_max` | Concrete near-i128::MAX |
+| `saturating_arithmetic_prevents_overflow` | Tests stdlib saturating arithmetic, not percolator |
+| `funding_p5_invalid_bounds_return_overflow` | Symbolic bool selects 2 concrete error paths (guard check) |
+| `proof_total_open_interest_initial` | Trivial base case: new engine has OI == 0 |
+| `proof_inv_holds_for_new_engine` | Constructor base case: new engine satisfies INV |
+| `kani_cross_lp_close_no_pnl_teleport` | Specific regression with custom matchers (P90k, AtOracle) |
 | `proof_NEGATIVE_bypass_set_pnl_breaks_invariant` | Negative should_panic meta-test |
-| `proof_init_in_place_satisfies_inv` | Constructor base case |
-| `proof_flaw1_debt_writeoff_requires_flat_position` | Concrete rebuttal scenario |
-| `proof_flaw1_gc_never_writes_off_with_open_position` | Concrete rebuttal scenario |
+| `proof_init_in_place_satisfies_inv` | Constructor base case: init_in_place satisfies INV |
 
 ---
 
@@ -387,6 +370,29 @@ All 23 previously-WEAK proofs were strengthened to STRONG:
 | `proof_effective_pnl_bounded_by_actual` | canonical_inv + symbolic insurance |
 | `proof_set_capital_decrease_preserves_conservation` | Upgraded to canonical_inv on decrease |
 | `proof_flaw2_withdraw_settles_before_margin_check` | canonical_inv on setup; conditional non-vacuity |
+
+17 additional UNIT TEST proofs were upgraded to STRONG:
+
+| Proof | Fix Applied |
+|---|---|
+| `zero_pnl_withdrawable_is_zero` | Symbolic slot+reserved_pnl |
+| `proof_trading_credits_fee_to_user` | Symbolic size [100,5M]; fix ceiling-div fee formula |
+| `proof_lq4_liquidation_fee_paid_to_insurance` | Symbolic capital [50K,200K]; fee cap |
+| `withdrawal_rejects_if_below_initial_margin_at_oracle` | Symbolic capital [5K,20K]+withdraw; both accept+reject |
+| `proof_add_user_structural_integrity` | Symbolic deposit_amt+fee |
+| `kani_no_teleport_cross_lp_close` | Symbolic oracle [500K,2M]+size [1K,10M] |
+| `kani_rejects_invalid_matcher_output` | Symbolic oracle+size |
+| `proof_gap1_touch_account_err_no_mutation` | Symbolic position [MAX/2,MAX]+capital+delta |
+| `proof_gap1_settle_mark_err_no_mutation` | Symbolic position+capital+pnl_offset |
+| `proof_gap2_rejects_overfill_matcher` | Symbolic oracle+size |
+| `proof_gap2_rejects_zero_price_matcher` | Symbolic oracle+size |
+| `proof_gap2_rejects_max_price_exceeded_matcher` | Symbolic oracle+size |
+| `proof_gap4_trade_extreme_price_no_panic` | Symbolic oracle [1,MAX_ORACLE_PRICE] (replaces 3 concrete) |
+| `proof_gap4_trade_extreme_size_no_panic` | Symbolic size [1,MAX_POSITION_ABS] (replaces 3 concrete) |
+| `proof_gap4_margin_extreme_values_no_panic` | Symbolic pos/capital/pnl/oracle; full valid ranges |
+| `proof_gap5_fee_credits_saturating_near_max` | Symbolic offset [1,10K] from i128::MAX |
+| `proof_flaw1_debt_writeoff_requires_flat_position` | Symbolic capital [100,5K]+loss |
+| `proof_flaw1_gc_never_writes_off_with_open_position` | Symbolic neg_pnl+position |
 
 6 previously-UNIT TEST proofs were upgraded to STRONG:
 
