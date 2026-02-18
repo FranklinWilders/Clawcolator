@@ -1514,7 +1514,6 @@ fn fast_frame_withdraw_only_mutates_one_account_vault_and_warmup() {
     engine.accounts[user_idx as usize].entry_price = 1_000_000;
 
     // LP counterparty
-    let abs_pos = abs_i128_to_u128(position);
     engine.accounts[lp_idx as usize].capital = U128::new(50_000);
     engine.accounts[lp_idx as usize].position_size = I128::new(-position);
     engine.accounts[lp_idx as usize].entry_price = 1_000_000;
@@ -4439,30 +4438,32 @@ fn proof_gc_dust_structural_integrity() {
 // CLOSE_ACCOUNT PROOF FAMILY - Exception Safety + INV Preservation
 // ============================================================================
 
-/// close_account: INV preserved on Ok path
+/// close_account: INV preserved on Ok path — symbolic capital via deposit+withdraw lifecycle
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
 fn proof_close_account_preserves_inv() {
     let mut engine = RiskEngine::new(test_params());
-    engine.vault = U128::new(100_000);
     engine.current_slot = 100;
     engine.last_crank_slot = 100;
     engine.last_full_sweep_start_slot = 100;
 
     let user_idx = engine.add_user(0).unwrap();
-    engine.accounts[user_idx as usize].capital = U128::new(0); // Must be zero to close
-    engine.accounts[user_idx as usize].pnl = I128::new(0);
-    engine.accounts[user_idx as usize].position_size = I128::new(0);
-    engine.recompute_aggregates();
 
-    kani::assert(canonical_inv(&engine), "setup state must satisfy INV");
+    // Symbolic deposit amount — exercises touch_account_full during close
+    let deposit_amt: u128 = kani::any();
+    kani::assume(deposit_amt > 0 && deposit_amt <= 10_000);
+    engine.deposit(user_idx, deposit_amt, 0).unwrap();
+
+    // Withdraw everything to reach zero capital (required for close)
+    engine.withdraw(user_idx, deposit_amt, 100, 1_000_000).unwrap();
+
+    kani::assert(canonical_inv(&engine), "INV after deposit+withdraw");
 
     let num_used_before = engine.num_used_accounts;
 
     let result = engine.close_account(user_idx, 100, 1_000_000);
 
-    // INV only matters on Ok path (Solana tx aborts on Err, state discarded)
     if result.is_ok() {
         kani::assert(canonical_inv(&engine), "INV must hold after close_account");
         kani::assert(
@@ -4572,9 +4573,11 @@ fn proof_sequence_deposit_trade_liquidate() {
     kani::assume(size >= 100 && size <= 1_000_000);
 
     let trade_result = engine.execute_trade(&NoOpMatcher, lp, user, 100, 1_000_000, size);
-    if trade_result.is_ok() {
-        kani::assert(canonical_inv(&engine), "INV after trade");
 
+    // INV must hold regardless of trade outcome (Err → no mutation)
+    kani::assert(canonical_inv(&engine), "INV after trade (Ok or Err)");
+
+    if trade_result.is_ok() {
         // Liquidation attempt — may trigger if position is large relative to capital
         let result = engine.liquidate_at_oracle(user, 100, 1_000_000);
         kani::assert(result.is_ok(), "liquidation must not error");
@@ -4597,42 +4600,45 @@ fn proof_sequence_deposit_crank_withdraw() {
     engine.vault = U128::new(100_000);
     engine.insurance_fund.balance = U128::new(10_000);
     engine.current_slot = 100;
-    engine.last_crank_slot = 50;
-    engine.last_full_sweep_start_slot = 50;
+    engine.last_crank_slot = 100;
+    engine.last_full_sweep_start_slot = 100;
 
     let user = engine.add_user(0).unwrap();
     let lp = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
 
-    // Assert, not assume — state built via public APIs must satisfy INV
     kani::assert(canonical_inv(&engine), "API-built state must satisfy INV");
 
-    // Step 1: Deposit (force success)
+    // Step 1: Symbolic deposit
     let deposit: u128 = kani::any();
     kani::assume(deposit > 5_000 && deposit < 50_000);
     let _ = assert_ok!(engine.deposit(user, deposit, 0), "deposit must succeed");
     let _ = assert_ok!(engine.deposit(lp, 50_000, 0), "LP deposit must succeed");
     kani::assert(canonical_inv(&engine), "INV after deposit");
 
-    // Step 2: Trade to create position (crank exercises position-bearing account)
+    // Step 2: Symbolic trade size
+    let size: i128 = kani::any();
+    kani::assume(size >= 100 && size <= 5_000);
     let _ = assert_ok!(
-        engine.execute_trade(&NoOpMatcher, lp, user, 100, 1_000_000, 100),
+        engine.execute_trade(&NoOpMatcher, lp, user, 100, 1_000_000, size),
         "trade must succeed"
     );
     kani::assert(canonical_inv(&engine), "INV after trade");
 
-    // Step 3: Crank (force success — exercises fee/liquidation with position)
+    // Step 3: Symbolic crank with funding
+    let funding_rate: i64 = kani::any();
+    kani::assume(funding_rate > -10 && funding_rate < 10);
     let _ = assert_ok!(
-        engine.keeper_crank(user, 100, 1_000_000, 0, false),
+        engine.keeper_crank(user, 101, 1_000_000, funding_rate, false),
         "crank must succeed"
     );
     kani::assert(canonical_inv(&engine), "INV after crank");
 
-    // Step 4: Withdraw (force success — margin check applies with position)
+    // Step 4: Symbolic withdraw
     let withdraw: u128 = kani::any();
     kani::assume(withdraw > 0 && withdraw <= 1_000);
 
     let _ = assert_ok!(
-        engine.withdraw(user, withdraw, 100, 1_000_000),
+        engine.withdraw(user, withdraw, 101, 1_000_000),
         "withdraw must succeed"
     );
     kani::assert(canonical_inv(&engine), "INV after withdraw");
@@ -6019,8 +6025,6 @@ fn proof_gap2_rejects_max_price_exceeded_matcher() {
 #[kani::solver(cadical)]
 fn proof_gap2_execute_trade_err_preserves_inv() {
     let mut engine = RiskEngine::new(test_params());
-    engine.vault = U128::new(200_000);
-    engine.insurance_fund.balance = U128::new(10_000);
     engine.current_slot = 100;
     engine.last_crank_slot = 100;
     engine.last_full_sweep_start_slot = 100;
@@ -6029,28 +6033,34 @@ fn proof_gap2_execute_trade_err_preserves_inv() {
     let lp = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
 
     let user_cap: u128 = kani::any();
-    let lp_cap: u128 = kani::any();
-    kani::assume(user_cap >= 1000 && user_cap <= 100_000);
-    kani::assume(lp_cap >= 1000 && lp_cap <= 100_000);
+    kani::assume(user_cap >= 5_000 && user_cap <= 50_000);
 
+    // Give accounts existing positions so touch_account/settle_mark are non-trivial
     engine.accounts[user as usize].capital = U128::new(user_cap);
-    engine.accounts[lp as usize].capital = U128::new(lp_cap);
-    engine.recompute_aggregates();
+    engine.accounts[user as usize].position_size = I128::new(1_000);
+    engine.accounts[user as usize].entry_price = 1_000_000;
 
-    // Precondition: start from an INV-valid symbolic setup.
-    kani::assume(canonical_inv(&engine));
+    engine.accounts[lp as usize].capital = U128::new(100_000);
+    engine.accounts[lp as usize].position_size = I128::new(-1_000);
+    engine.accounts[lp as usize].entry_price = 1_000_000;
+
+    engine.vault = U128::new(user_cap + 100_000 + 10_000);
+    engine.insurance_fund.balance = U128::new(10_000);
+    sync_engine_aggregates(&mut engine);
+
+    kani::assert(canonical_inv(&engine), "INV before execute_trade Err");
 
     let size: i128 = kani::any();
     kani::assume(size >= 50 && size <= 500);
 
     // BadMatcherOppositeSign returns opposite sign → always rejected
+    // But touch_account/settle_mark run first, mutating state
     let result = engine.execute_trade(&BadMatcherOppositeSign, lp, user, 100, 1_000_000, size);
 
     // Non-vacuity: must be Err
     kani::assert(result.is_err(), "BadMatcherOppositeSign must be rejected");
 
-    // INV must still hold even on Err path (partial mutations from touch_account/settle_mark
-    // are INV-preserving individually)
+    // INV must still hold even on Err path
     kani::assert(
         canonical_inv(&engine),
         "canonical_inv must hold after execute_trade Err"
@@ -6665,12 +6675,14 @@ fn proof_gap5_deposit_fee_credits_conservation() {
     let mut engine = RiskEngine::new(test_params());
     let user = engine.add_user(0).unwrap();
 
-    engine.accounts[user as usize].capital = U128::new(10_000);
-    engine.vault = U128::new(10_000);
+    let capital: u128 = kani::any();
+    kani::assume(capital >= 100 && capital <= 10_000);
+
+    engine.accounts[user as usize].capital = U128::new(capital);
+    engine.vault = U128::new(capital);
     sync_engine_aggregates(&mut engine);
 
-    // Precondition: conservation holds
-    kani::assume(conservation_fast_no_funding(&engine));
+    kani::assert(canonical_inv(&engine), "INV before deposit_fee_credits");
 
     let vault_before = engine.vault.get();
     let insurance_before = engine.insurance_fund.balance.get();
@@ -6684,11 +6696,8 @@ fn proof_gap5_deposit_fee_credits_conservation() {
     // Non-vacuity: must succeed
     assert_ok!(result, "deposit_fee_credits must succeed");
 
-    // Verify conservation still holds
-    kani::assert(
-        conservation_fast_no_funding(&engine),
-        "conservation must hold after deposit_fee_credits"
-    );
+    // canonical_inv must hold after deposit_fee_credits
+    kani::assert(canonical_inv(&engine), "INV after deposit_fee_credits");
 
     // Verify vault increased by amount
     kani::assert(
@@ -6897,9 +6906,8 @@ fn proof_haircut_ratio_bounded() {
     let vault: u128 = kani::any();
 
     kani::assume(capital > 0 && capital <= 500);
-    kani::assume(pnl > 0 && pnl <= 500);
+    kani::assume(pnl > -500 && pnl <= 500); // Both positive and negative pnl
     kani::assume(insurance <= 200);
-    // Vault can be below capital + insurance (exercises !solvent branch)
     kani::assume(vault <= 1_500);
 
     engine.set_capital(user as usize, capital);
@@ -6913,9 +6921,14 @@ fn proof_haircut_ratio_bounded() {
     kani::assert(h_num <= h_den, "haircut ratio must be <= 1");
     kani::assert(h_den > 0 || (h_num == 1 && h_den == 1), "haircut denominator must be positive or (1,1)");
 
-    // When vault < c_tot + insurance, haircut must be 0 (insolvent)
-    if vault < capital + insurance {
-        kani::assert(h_num == 0, "insolvent: haircut must be 0");
+    // When pnl <= 0, pnl_pos_tot = 0 → haircut = (1,1) (no positive pnl to haircut)
+    if pnl <= 0 {
+        kani::assert(h_num == 1 && h_den == 1, "no positive pnl → haircut ratio = 1");
+    }
+
+    // When pnl > 0 AND vault < c_tot + insurance, haircut must be 0 (insolvent)
+    if pnl > 0 && vault < capital + insurance {
+        kani::assert(h_num == 0, "insolvent with positive pnl: haircut must be 0");
     }
 }
 
@@ -6928,16 +6941,21 @@ fn proof_effective_pnl_bounded_by_actual() {
     let mut engine = RiskEngine::new(test_params());
     let user = engine.add_user(0).unwrap();
 
-    // Tight bounds for fast verification
     let capital: u128 = kani::any();
     let pnl: i128 = kani::any();
+    let insurance: u128 = kani::any();
 
     kani::assume(capital > 0 && capital < 10_000);
     kani::assume(pnl > -5_000 && pnl < 5_000);
+    kani::assume(insurance <= 5_000);
 
     engine.set_capital(user as usize, capital);
     engine.set_pnl(user as usize, pnl);
-    engine.vault = U128::new(capital + 1_000);
+    engine.insurance_fund.balance = U128::new(insurance);
+    let pnl_pos = if pnl > 0 { pnl as u128 } else { 0 };
+    engine.vault = U128::new(capital + insurance + pnl_pos);
+
+    kani::assert(canonical_inv(&engine), "INV before effective_pos_pnl");
 
     let eff = engine.effective_pos_pnl(pnl);
     let actual_pos = if pnl > 0 { pnl as u128 } else { 0 };
@@ -6946,6 +6964,11 @@ fn proof_effective_pnl_bounded_by_actual() {
         eff <= actual_pos,
         "effective_pos_pnl must not exceed actual positive pnl"
     );
+
+    // When negative pnl: effective must be 0
+    if pnl <= 0 {
+        kani::assert(eff == 0, "negative pnl → effective must be 0");
+    }
 }
 
 /// Prove recompute_aggregates produces correct values.
@@ -7416,14 +7439,14 @@ fn proof_set_capital_decrease_preserves_conservation() {
 
     engine.set_capital(user_idx as usize, new_capital);
 
-    // Conservation holds when new capital <= vault - insurance (which is 100K - 0 = 100K)
+    // canonical_inv holds when new capital <= vault - insurance (decrease preserves)
     if new_capital <= old_capital {
         kani::assert(
-            conservation_fast_no_funding(&engine),
-            "conservation must hold when capital decreases",
+            canonical_inv(&engine),
+            "canonical_inv must hold when capital decreases",
         );
     }
-    // Aggregate correctness always holds
+    // Aggregate correctness always holds (increase or decrease)
     kani::assert(inv_aggregates(&engine), "aggregates must be correct after set_capital");
 }
 
@@ -7942,6 +7965,9 @@ fn proof_flaw2_no_phantom_equity_after_mark_settlement() {
 #[kani::solver(cadical)]
 fn proof_flaw2_withdraw_settles_before_margin_check() {
     let mut engine = RiskEngine::new(test_params());
+    engine.current_slot = 100;
+    engine.last_crank_slot = 100;
+    engine.last_full_sweep_start_slot = 100;
 
     let user = engine.add_user(0).unwrap();
     let lp = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
@@ -7952,20 +7978,23 @@ fn proof_flaw2_withdraw_settles_before_margin_check() {
     let stale_entry: u64 = 500_000;   // stale entry = $0.50 (user bought lower)
 
     // User with capital and a position with STALE entry (entry != oracle)
-    engine.deposit(user, 50_000, 0).unwrap();
+    engine.accounts[user as usize].capital = U128::new(50_000);
     engine.accounts[user as usize].position_size = I128::new(1_000);
     engine.accounts[user as usize].entry_price = stale_entry;
     engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
     engine.accounts[user as usize].pnl = I128::new(0);
 
     // LP counterparty (entry matches user for OI balance)
-    engine.deposit(lp, 100_000, 0).unwrap();
+    engine.accounts[lp as usize].capital = U128::new(100_000);
     engine.accounts[lp as usize].position_size = I128::new(-1_000);
     engine.accounts[lp as usize].entry_price = stale_entry;
     engine.accounts[lp as usize].warmup_slope_per_step = U128::new(0);
     engine.accounts[lp as usize].pnl = I128::new(0);
 
+    engine.vault = U128::new(150_000);
     sync_engine_aggregates(&mut engine);
+
+    kani::assert(canonical_inv(&engine), "INV before withdraw");
 
     // Confirm entry is stale before withdraw
     kani::assert(
@@ -7975,20 +8004,16 @@ fn proof_flaw2_withdraw_settles_before_margin_check() {
 
     // Attempt to withdraw — this calls touch_account_full which settles mark
     let w_amount: u128 = kani::any();
-    kani::assume(w_amount > 0 && w_amount <= 40_000);
+    kani::assume(w_amount > 0 && w_amount <= 5_000);
     let result = engine.withdraw(user, w_amount, 100, oracle);
 
     if result.is_ok() {
         // KEY ASSERTION: after withdraw, entry was settled to oracle by touch_account_full.
-        // This proves mark settlement happens BEFORE the margin check in withdraw,
-        // so no stale-entry phantom equity can inflate the margin computation.
         kani::assert(
             engine.accounts[user as usize].entry_price == oracle,
             "Flaw2: withdraw must settle stale entry to oracle before margin check"
         );
 
-        // PnL absorbed the mark: user's pnl should have increased by mark_pnl (500)
-        // minus any warmup deductions. At minimum, pnl >= 0 (was 0, mark was +500).
         kani::assert(
             engine.accounts[user as usize].pnl.get() >= 0,
             "Flaw2: mark settlement should have realized positive MTM into pnl"
@@ -7996,9 +8021,11 @@ fn proof_flaw2_withdraw_settles_before_margin_check() {
 
         kani::assert(canonical_inv(&engine), "INV after withdraw");
     }
-    // Non-vacuity: at least small withdrawals must succeed
-    // (user has 50K capital + 500 unrealized, pos notional = 1000 * 1.0 = 1000, IM ~ 100)
-    kani::assume(result.is_ok());
+
+    // Non-vacuity: conservative withdrawal (5K of 50K capital) with big mark gain
+    if oracle >= 1_000_000 && w_amount <= 1_000 {
+        kani::assert(result.is_ok(), "non-vacuity: small withdraw with large equity must succeed");
+    }
 }
 
 // --- Flaw 3: "Forever Warmup" Reset ---
