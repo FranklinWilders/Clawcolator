@@ -82,7 +82,7 @@ If the system is stressed, `h` falls and less profit converts. If losses are rea
 Withdrawable value <= Backed capital
 ```
 
-Formally verified with 145 Kani proofs covering conservation, principal protection, isolation, and no-teleport properties.
+Formally verified with 157 Kani proofs (11 inductive, 144 strong, 2 unit test) covering conservation, principal protection, isolation, and no-teleport properties.
 
 ## Open Source
 
