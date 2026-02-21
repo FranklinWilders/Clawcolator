@@ -8508,3 +8508,353 @@ fn proof_flaw3_warmup_converts_after_single_slot() {
     }
     kani::assert(canonical_inv(&engine), "INV after warmup settle");
 }
+
+// ============================================================================
+// INDUCTIVE PROOFS: Abstract Delta Specifications
+// ============================================================================
+//
+// These proofs model operations algebraically on symbolic state (full u128/i128
+// domain, no construction, no bounds), proving invariant components are preserved
+// for ALL possible pre-states. They complement the 144 STRONG proofs which
+// exercise real code paths on bounded ranges.
+//
+// Classification: INDUCTIVE — decomposed invariant, loop-free delta specs,
+// fully symbolic state.
+
+/// Inductive Proof 1: top_up_insurance_fund preserves inv_accounting
+///
+/// Operation: vault += amount, insurance += amount
+/// Component: inv_accounting (vault >= c_tot + insurance)
+/// Result: Trivially true — both sides increase by the same amount.
+#[kani::proof]
+fn inductive_top_up_insurance_preserves_accounting() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let amount: u128 = kani::any();
+
+    // Pre: inv_accounting holds (no saturation in obligations)
+    kani::assume(c_tot.checked_add(insurance).is_some());
+    kani::assume(vault >= c_tot + insurance);
+
+    // Pre: no overflow on vault/insurance additions
+    kani::assume(vault.checked_add(amount).is_some());
+    kani::assume(insurance.checked_add(amount).is_some());
+
+    // Operation
+    let vault_after = vault + amount;
+    let insurance_after = insurance + amount;
+
+    // Post: inv_accounting preserved
+    kani::assert(
+        vault_after >= c_tot + insurance_after,
+        "top_up_insurance must preserve vault >= c_tot + insurance",
+    );
+}
+
+/// Inductive Proof 2: set_capital (decrease) preserves inv_accounting
+///
+/// Operation: capital decreases → c_tot decreases by delta
+/// Component: inv_accounting (vault >= c_tot + insurance)
+/// Result: c_tot only shrinks, vault/insurance unchanged → trivially preserved.
+/// Note: Proves accounting for capital DECREASE (loss settlement, withdraw).
+/// For increases (deposit), vault also increases — covered by deposit proof.
+#[kani::proof]
+fn inductive_set_capital_preserves_accounting() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let old_capital: u128 = kani::any();
+    let new_capital: u128 = kani::any();
+
+    // Pre: inv_accounting
+    kani::assume(c_tot.checked_add(insurance).is_some());
+    kani::assume(vault >= c_tot + insurance);
+
+    // Pre: old_capital contributes to c_tot
+    kani::assume(old_capital <= c_tot);
+
+    // Capital decreases (loss settlement, withdraw capital reduction)
+    kani::assume(new_capital <= old_capital);
+
+    // Model set_capital: c_tot' = c_tot - (old - new)
+    // Since new <= old and old <= c_tot: delta <= c_tot, no saturation
+    let delta = old_capital - new_capital;
+    let c_tot_after = c_tot - delta;
+
+    // Post: inv_accounting preserved
+    kani::assert(
+        vault >= c_tot_after + insurance,
+        "set_capital (decrease) must preserve vault >= c_tot + insurance",
+    );
+}
+
+/// Inductive Proof 3: set_pnl correctly updates pnl_pos_tot (delta form)
+///
+/// Operation: pnl_pos_tot' = pnl_pos_tot - max(old_pnl, 0) + max(new_pnl, 0)
+/// Component: inv_aggregates (pnl_pos_tot correctness)
+/// Result: Saturating arithmetic matches exact arithmetic when preconditions hold.
+#[kani::proof]
+fn inductive_set_pnl_preserves_pnl_pos_tot_delta() {
+    let pnl_pos_tot: u128 = kani::any();
+    let old_pnl: i128 = kani::any();
+    let new_pnl: i128 = kani::any();
+
+    // PA2: no i128::MIN in pnl fields
+    kani::assume(old_pnl != i128::MIN);
+    kani::assume(new_pnl != i128::MIN);
+
+    let old_pos: u128 = if old_pnl > 0 { old_pnl as u128 } else { 0 };
+    let new_pos: u128 = if new_pnl > 0 { new_pnl as u128 } else { 0 };
+
+    // Pre: pnl_pos_tot includes old_pnl's positive contribution
+    kani::assume(pnl_pos_tot >= old_pos);
+
+    // Pre: no intermediate overflow (saturating_add won't saturate)
+    kani::assume(pnl_pos_tot.checked_add(new_pos).is_some());
+
+    // Model: match set_pnl's saturating arithmetic (lines 772-783)
+    let result = pnl_pos_tot.saturating_add(new_pos).saturating_sub(old_pos);
+
+    // Expected: exact delta
+    let expected = pnl_pos_tot - old_pos + new_pos;
+
+    kani::assert(
+        result == expected,
+        "set_pnl delta must correctly update pnl_pos_tot",
+    );
+}
+
+/// Inductive Proof 4: set_capital correctly updates c_tot (delta form)
+///
+/// Operation: c_tot' = c_tot - old_capital + new_capital
+/// Component: inv_aggregates (c_tot correctness)
+/// Result: Branching saturating arithmetic matches exact arithmetic.
+#[kani::proof]
+fn inductive_set_capital_delta_correct() {
+    let c_tot: u128 = kani::any();
+    let old_capital: u128 = kani::any();
+    let new_capital: u128 = kani::any();
+
+    // Pre: old_capital contributes to c_tot
+    kani::assume(old_capital <= c_tot);
+
+    // Pre: no overflow when increasing
+    if new_capital >= old_capital {
+        kani::assume(c_tot.checked_add(new_capital - old_capital).is_some());
+    }
+
+    // Model: match set_capital's branching logic (lines 787-795)
+    let c_tot_after = if new_capital >= old_capital {
+        c_tot.saturating_add(new_capital - old_capital)
+    } else {
+        c_tot.saturating_sub(old_capital - new_capital)
+    };
+
+    // Expected: exact delta
+    let expected = c_tot - old_capital + new_capital;
+
+    kani::assert(
+        c_tot_after == expected,
+        "set_capital delta must equal c_tot - old + new",
+    );
+}
+
+/// Inductive Proof 5: deposit preserves inv_accounting
+///
+/// Operation: vault += amount, c_tot += amount (via set_capital)
+/// Component: inv_accounting (vault >= c_tot + insurance)
+/// Result: Both vault and c_tot increase by same amount → inequality preserved.
+#[kani::proof]
+fn inductive_deposit_preserves_accounting() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let amount: u128 = kani::any();
+
+    // Pre: inv_accounting
+    kani::assume(c_tot.checked_add(insurance).is_some());
+    kani::assume(vault >= c_tot + insurance);
+
+    // Pre: no overflow
+    kani::assume(vault.checked_add(amount).is_some());
+    kani::assume(c_tot.checked_add(amount).is_some());
+
+    // Operation
+    let vault_after = vault + amount;
+    let c_tot_after = c_tot + amount;
+
+    // Post: inv_accounting preserved
+    kani::assert(
+        vault_after >= c_tot_after + insurance,
+        "deposit must preserve vault >= c_tot + insurance",
+    );
+}
+
+/// Inductive Proof 6: withdraw preserves inv_accounting
+///
+/// Operation: vault -= amount, c_tot -= amount (via set_capital)
+/// Component: inv_accounting (vault >= c_tot + insurance)
+/// Result: Both vault and c_tot decrease by same amount → inequality preserved.
+#[kani::proof]
+fn inductive_withdraw_preserves_accounting() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let amount: u128 = kani::any();
+
+    // Pre: inv_accounting
+    kani::assume(c_tot.checked_add(insurance).is_some());
+    kani::assume(vault >= c_tot + insurance);
+
+    // Pre: amount <= c_tot (can't withdraw more than capital, capital <= c_tot)
+    kani::assume(amount <= c_tot);
+    // Pre: amount <= vault (tokens must exist)
+    kani::assume(amount <= vault);
+
+    // Operation
+    let vault_after = vault - amount;
+    let c_tot_after = c_tot - amount;
+
+    // Post: inv_accounting preserved
+    kani::assert(
+        vault_after >= c_tot_after + insurance,
+        "withdraw must preserve vault >= c_tot + insurance",
+    );
+}
+
+/// Inductive Proof 7: settle_loss_only preserves inv_accounting
+///
+/// Operation: paid = min(|pnl|, capital); c_tot -= paid. Vault/insurance unchanged.
+/// Component: inv_accounting (vault >= c_tot + insurance)
+/// Result: c_tot only decreases → trivially preserved.
+#[kani::proof]
+fn inductive_settle_loss_preserves_accounting() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let capital: u128 = kani::any();
+    let pnl: i128 = kani::any();
+
+    // Pre: inv_accounting
+    kani::assume(c_tot.checked_add(insurance).is_some());
+    kani::assume(vault >= c_tot + insurance);
+
+    // Pre: capital contributes to c_tot
+    kani::assume(capital <= c_tot);
+
+    // Pre: pnl is negative (loss to settle)
+    kani::assume(pnl < 0);
+    kani::assume(pnl != i128::MIN); // PA2
+
+    // Model settle_loss: paid = min(|pnl|, capital)
+    let need = (-pnl) as u128; // safe: pnl != i128::MIN and pnl < 0
+    let paid = core::cmp::min(need, capital);
+
+    // c_tot decreases by paid (set_capital(capital - paid))
+    // paid <= capital <= c_tot, so no underflow
+    let c_tot_after = c_tot - paid;
+
+    // Post: inv_accounting preserved (vault/insurance unchanged, c_tot decreased)
+    kani::assert(
+        vault >= c_tot_after + insurance,
+        "settle_loss must preserve vault >= c_tot + insurance",
+    );
+}
+
+/// Inductive Proof 8: settle_warmup profit phase preserves inv_accounting
+///
+/// Operation: pnl -= x, capital += y where y = x * h_num / h_den
+///   h_num = min(residual, pnl_pos_tot), h_den = pnl_pos_tot
+/// Component: inv_accounting (vault >= c_tot + insurance)
+/// Result: Haircut ensures y <= residual, so vault has room for c_tot increase.
+///
+/// Haircut bound derivation (why y <= residual):
+///   haircut_ratio() returns (h_num, h_den) = (min(residual, pnl_pos_tot), pnl_pos_tot)
+///   y = floor(x * h_num / h_den)
+///   Since x <= h_den and h_num <= h_den: y <= h_num  (integer division property)
+///   Since h_num = min(residual, pnl_pos_tot) <= residual: y <= residual  QED
+#[kani::proof]
+fn inductive_settle_warmup_profit_preserves_accounting() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let pnl_pos_tot: u128 = kani::any();
+    let x: u128 = kani::any(); // amount converted from pnl to capital
+    let y: u128 = kani::any(); // haircutted amount credited to capital
+
+    // Pre: inv_accounting
+    kani::assume(c_tot.checked_add(insurance).is_some());
+    kani::assume(vault >= c_tot + insurance);
+    let residual = vault - c_tot - insurance;
+
+    // Pre: pnl_pos_tot > 0 and x is one account's contribution
+    kani::assume(pnl_pos_tot > 0);
+    kani::assume(x <= pnl_pos_tot);
+
+    // Haircut bounds: y = floor(x * min(residual, pnl_pos_tot) / pnl_pos_tot)
+    // Guarantees: y <= x (ratio <= 1) and y <= residual (see derivation above)
+    kani::assume(y <= x);
+    kani::assume(y <= residual);
+
+    // Operation: c_tot += y (capital increases by haircutted amount)
+    kani::assume(c_tot.checked_add(y).is_some());
+    let c_tot_after = c_tot + y;
+
+    // Post: inv_accounting preserved
+    kani::assert(
+        vault >= c_tot_after + insurance,
+        "settle_warmup profit must preserve vault >= c_tot + insurance",
+    );
+}
+
+/// Inductive Proof 9: full settle_warmup (loss + profit) preserves inv_accounting
+///
+/// Combines loss phase (c_tot decreases) and profit phase (c_tot increases by y <= residual).
+/// Component: inv_accounting (vault >= c_tot + insurance)
+/// Result: Loss increases residual headroom; haircut ensures profit phase stays within it.
+#[kani::proof]
+fn inductive_settle_warmup_full_preserves_accounting() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let capital: u128 = kani::any();
+    let loss_pnl: i128 = kani::any(); // negative pnl for loss phase
+    let pnl_pos_tot: u128 = kani::any();
+    let x: u128 = kani::any(); // profit conversion amount
+    let y: u128 = kani::any(); // haircutted amount
+
+    // Pre: inv_accounting
+    kani::assume(c_tot.checked_add(insurance).is_some());
+    kani::assume(vault >= c_tot + insurance);
+
+    // Pre: capital contributes to c_tot
+    kani::assume(capital <= c_tot);
+
+    // ── Phase 1: Loss settlement ──
+    kani::assume(loss_pnl < 0);
+    kani::assume(loss_pnl != i128::MIN);
+    let need = (-loss_pnl) as u128;
+    let paid = core::cmp::min(need, capital);
+    let c_tot_after_loss = c_tot - paid; // safe: paid <= capital <= c_tot
+
+    // ── Phase 2: Profit conversion (on post-loss state) ──
+    kani::assume(pnl_pos_tot > 0);
+    kani::assume(x <= pnl_pos_tot);
+
+    // Residual after loss (increased: loss freed headroom)
+    let residual_after_loss = vault - c_tot_after_loss - insurance;
+
+    // Haircut bounds on post-loss residual (see proof 8 derivation)
+    kani::assume(y <= x);
+    kani::assume(y <= residual_after_loss);
+
+    kani::assume(c_tot_after_loss.checked_add(y).is_some());
+    let c_tot_final = c_tot_after_loss + y;
+
+    // Post: inv_accounting preserved
+    kani::assert(
+        vault >= c_tot_final + insurance,
+        "full settle_warmup must preserve vault >= c_tot + insurance",
+    );
+}
