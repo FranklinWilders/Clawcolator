@@ -8810,11 +8810,15 @@ fn inductive_settle_warmup_profit_preserves_accounting() {
     );
 }
 
-/// Inductive Proof 9: full settle_warmup (loss + profit) preserves inv_accounting
+/// Inductive Proof 9: one-step settle_warmup_to_capital preserves inv_accounting
 ///
-/// Combines loss phase (c_tot decreases) and profit phase (c_tot increases by y <= residual).
+/// Models the real control flow in `settle_warmup_to_capital`:
+///   - if pnl < 0: settle loss / write off to zero, no profit conversion in same step
+///   - else if pnl > 0: convert warmable profit to capital at haircut
+///   - else: no-op
+///
+/// This avoids the infeasible "loss then profit in one call" model.
 /// Component: inv_accounting (vault >= c_tot + insurance)
-/// Result: Loss increases residual headroom; haircut ensures profit phase stays within it.
 #[kani::proof]
 fn inductive_settle_warmup_full_preserves_accounting() {
     // Use u8 symbolic domain (lifted to u128) for tractable nonlinear arithmetic.
@@ -8822,7 +8826,7 @@ fn inductive_settle_warmup_full_preserves_accounting() {
     let c_tot = kani::any::<u8>() as u128;
     let insurance = kani::any::<u8>() as u128;
     let capital = kani::any::<u8>() as u128;
-    let loss_pnl = kani::any::<i8>() as i128; // negative pnl for loss phase
+    let pnl0 = kani::any::<i8>() as i128; // pre-state pnl
     let pnl_pos_tot = kani::any::<u8>() as u128;
     let x = kani::any::<u8>() as u128; // profit conversion amount
 
@@ -8833,34 +8837,40 @@ fn inductive_settle_warmup_full_preserves_accounting() {
     // Pre: capital contributes to c_tot
     kani::assume(capital <= c_tot);
 
-    // ── Phase 1: Loss settlement ──
-    kani::assume(loss_pnl < 0);
-    kani::assume(loss_pnl != i128::MIN);
-    let need = (-loss_pnl) as u128;
-    let paid = core::cmp::min(need, capital);
-    let c_tot_after_loss = c_tot - paid; // safe: paid <= capital <= c_tot
+    if pnl0 < 0 {
+        // Loss-settlement branch: settle against capital, then write off remaining loss to 0.
+        // No profit conversion can occur in this same call.
+        let need = (-pnl0) as u128;
+        let paid = core::cmp::min(need, capital);
+        let c_tot_final = c_tot - paid; // paid <= capital <= c_tot
+        kani::assert(
+            vault >= c_tot_final + insurance,
+            "settle_warmup loss branch must preserve vault >= c_tot + insurance",
+        );
+    } else if pnl0 > 0 {
+        // Profit-conversion branch.
+        kani::assume(pnl_pos_tot > 0);
+        kani::assume(x <= pnl_pos_tot);
 
-    // ── Phase 2: Profit conversion (on post-loss state) ──
-    kani::assume(pnl_pos_tot > 0);
-    kani::assume(x <= pnl_pos_tot);
+        let residual = vault - c_tot - insurance;
+        let h_num = core::cmp::min(residual, pnl_pos_tot);
+        let h_den = pnl_pos_tot;
+        kani::assume(x.checked_mul(h_num).is_some());
+        let y = (x * h_num) / h_den;
 
-    // Residual after loss (increased: loss freed headroom)
-    let residual_after_loss = vault - c_tot_after_loss - insurance;
-
-    // Model production haircut computation on post-loss state.
-    let h_num = core::cmp::min(residual_after_loss, pnl_pos_tot);
-    let h_den = pnl_pos_tot;
-    kani::assume(x.checked_mul(h_num).is_some());
-    let y = (x * h_num) / h_den;
-
-    kani::assume(c_tot_after_loss.checked_add(y).is_some());
-    let c_tot_final = c_tot_after_loss + y;
-
-    // Post: inv_accounting preserved
-    kani::assert(
-        vault >= c_tot_final + insurance,
-        "full settle_warmup must preserve vault >= c_tot + insurance",
-    );
+        kani::assume(c_tot.checked_add(y).is_some());
+        let c_tot_final = c_tot + y;
+        kani::assert(
+            vault >= c_tot_final + insurance,
+            "settle_warmup profit branch must preserve vault >= c_tot + insurance",
+        );
+    } else {
+        // pnl == 0: no-op
+        kani::assert(
+            vault >= c_tot + insurance,
+            "settle_warmup zero-pnl branch must preserve vault >= c_tot + insurance",
+        );
+    }
 }
 
 /// Inductive Proof 10: fee transfer (capital → insurance) preserves inv_accounting
