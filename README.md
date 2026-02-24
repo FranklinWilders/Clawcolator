@@ -1,4 +1,4 @@
-# Percolator
+# The Clawcolator.
 
 **EDUCATIONAL RESEARCH PROJECT — NOT PRODUCTION READY. NOT AUDITED. Do NOT use with real funds.**
 
